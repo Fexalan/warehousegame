@@ -1,0 +1,50 @@
+import { CurveballBanner } from "./components/CurveballBanner";
+import { Hud } from "./components/Hud";
+import { Toasts } from "./components/Toasts";
+import { Dashboard } from "./screens/Dashboard";
+import { DispatcherScreen } from "./screens/DispatcherScreen";
+import { Lobby } from "./screens/Lobby";
+import { PickerScreen } from "./screens/PickerScreen";
+import { ReceiverScreen } from "./screens/ReceiverScreen";
+import { ReplenisherScreen } from "./screens/ReplenisherScreen";
+import { useGame } from "./useGame";
+import { useTicker } from "./useTicker";
+
+export default function App() {
+  const game = useGame();
+  useTicker(250); // re-render for countdowns & animations
+
+  if (game.phase === "over" && game.reports) {
+    return <Dashboard reports={game.reports} seat={game.seat} />;
+  }
+
+  if (game.phase === "playing" && game.state && game.seat) {
+    const { state, seat } = game;
+    const screen = {
+      receiver: <ReceiverScreen state={state} send={game.send} />,
+      replenisher: <ReplenisherScreen state={state} send={game.send} gameNow={game.gameNow} />,
+      picker: <PickerScreen state={state} send={game.send} gameNow={game.gameNow} />,
+      dispatcher: <DispatcherScreen state={state} send={game.send} gameNow={game.gameNow} />,
+    }[seat.role];
+
+    return (
+      <div className="app">
+        <Hud state={state} seat={seat} gameNow={game.gameNow} />
+        {screen}
+        <CurveballBanner curveball={game.curveball} dismiss={game.dismissCurveball} gameNow={game.gameNow} />
+        <Toasts toasts={game.toasts} />
+      </div>
+    );
+  }
+
+  return (
+    <Lobby
+      phase={game.phase}
+      lobby={game.lobby}
+      seat={game.seat}
+      joinError={game.joinError}
+      join={game.join}
+      startGame={game.startGame}
+    />
+  );
+}
