@@ -1,21 +1,23 @@
 /**
  * Socket layer: rooms, intent routing, the 4 Hz broadcast loop.
  *
- * Room topology (the key to asymmetric broadcast):
+ * Room topology (asymmetric broadcast):
  *   g:{game}                      — everyone in the session (lobby, game_over)
  *   g:{game}:t:{team}             — one team's 4 screens (state snapshots)
- *   g:{game}:t:{team}:r:{role}    — a single role (targeted curveballs/toasts)
+ *   g:{game}:t:{team}:r:{role}    — a single role (targeted toasts/anomalies)
  */
 import { createServer } from "http";
 import { Server, Socket } from "socket.io";
 import { TICK_MS } from "../../shared/constants";
 import type {
+  Difficulty,
   GameOverPayload,
   Intent,
   JoinPayload,
   LobbyState,
   PlayerInfo,
   RoleId,
+  StartPayload,
   TeamReport,
 } from "../../shared/types";
 import { TeamEngine } from "./engine";
@@ -34,10 +36,11 @@ interface SeatKey {
 interface Game {
   id: string;
   status: "lobby" | "running" | "over";
+  difficulty: Difficulty;
   seed: number;
   startedAtWall: number;
-  engines: Map<string, TeamEngine>; // teamId -> engine
-  seats: Map<string, SeatKey>; // socketId -> seat
+  engines: Map<string, TeamEngine>;
+  seats: Map<string, SeatKey>;
   interval: ReturnType<typeof setInterval> | null;
   reports: TeamReport[] | null;
 }
@@ -46,7 +49,7 @@ const games = new Map<string, Game>();
 
 const httpServer = createServer((_req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("The Ripple Effect — game server running\n");
+  res.end("Warehouse simulator — game server running\n");
 });
 
 const io = new Server(httpServer, { cors: { origin: "*" } });
@@ -60,6 +63,7 @@ function getGame(gameId: string): Game {
     game = {
       id: gameId,
       status: "lobby",
+      difficulty: "normal",
       seed: hashSeed(`${gameId}:${Date.now()}`),
       startedAtWall: 0,
       engines: new Map(),
@@ -88,6 +92,7 @@ function lobbyState(game: Game): LobbyState {
   return {
     gameId: game.id,
     status: game.status,
+    difficulty: game.difficulty,
     teams: [...teamIds].sort().map((teamId) => ({ teamId, players: teamPlayers(game, teamId) })),
   };
 }
@@ -96,45 +101,40 @@ function broadcastLobby(game: Game) {
   io.to(`g:${game.id}`).emit("lobby", lobbyState(game));
 }
 
-function startGame(game: Game) {
+function startGame(game: Game, difficulty: Difficulty) {
   if (game.status !== "lobby") return;
   const teamIds = new Set([...game.seats.values()].map((s) => s.teamId));
   if (teamIds.size === 0) return;
 
   game.status = "running";
+  game.difficulty = difficulty;
   game.startedAtWall = Date.now();
   for (const teamId of teamIds) {
-    // Same seed for every team: identical trucks, orders and curveballs.
-    const engine = new TeamEngine(teamId, `Team ${teamId}`, game.seed);
+    // Same seed + same difficulty for every team: identical workload.
+    const engine = new TeamEngine(teamId, `Équipe ${teamId}`, game.seed, difficulty);
     engine.players = teamPlayers(game, teamId);
     game.engines.set(teamId, engine);
   }
   broadcastLobby(game);
-
   game.interval = setInterval(() => tickGame(game), TICK_MS);
 }
 
 function tickGame(game: Game) {
   const now = Date.now() - game.startedAtWall;
-  let over = false;
+  let allOver = game.engines.size > 0;
 
   for (const [teamId, engine] of game.engines) {
     const effects = engine.tick(now);
-    over = over || effects.gameOver;
+    if (!effects.gameOver) allOver = false;
 
     for (const toast of effects.toasts) {
       const room = toast.role === "all" ? teamRoom(game.id, teamId) : roleRoom(game.id, teamId, toast.role);
       io.to(room).emit("toast", { message: toast.message, severity: toast.severity });
     }
-    for (const cb of effects.curveballs) {
-      for (const role of cb.targets) {
-        io.to(roleRoom(game.id, teamId, role)).emit("curveball", cb);
-      }
-    }
     io.to(teamRoom(game.id, teamId)).emit("state", engine.serialize());
   }
 
-  if (over) endGame(game);
+  if (allOver) endGame(game);
 }
 
 function endGame(game: Game) {
@@ -155,17 +155,16 @@ io.on("connection", (socket: Socket) => {
   socket.on("join", (payload: JoinPayload, ack?: (res: { ok: boolean; error?: string }) => void) => {
     const { gameId, teamId, name, role } = payload;
     if (!gameId || !teamId || !name || !role) {
-      ack?.({ ok: false, error: "Missing join fields" });
+      ack?.({ ok: false, error: "Champs manquants" });
       return;
     }
     const game = getGame(gameId);
 
-    // One human per seat — but allow reclaiming a disconnected seat (refresh).
     for (const [sid, seat] of game.seats) {
       if (seat.teamId === teamId && seat.role === role) {
         const other = io.sockets.sockets.get(sid);
         if (other?.connected && sid !== socket.id) {
-          ack?.({ ok: false, error: `${role} is already taken on team ${teamId}` });
+          ack?.({ ok: false, error: `Le poste est déjà occupé dans l'équipe ${teamId}` });
           return;
         }
         game.seats.delete(sid);
@@ -183,14 +182,13 @@ io.on("connection", (socket: Socket) => {
     ack?.({ ok: true });
     broadcastLobby(game);
 
-    // Late join / reconnect mid-game: ship the current snapshot immediately.
     if (game.status === "running" && engine) socket.emit("state", engine.serialize());
     if (game.status === "over" && game.reports) socket.emit("game_over", { reports: game.reports });
   });
 
-  socket.on("start_game", () => {
+  socket.on("start_game", (payload?: StartPayload) => {
     const seat = findSeat(socket.id);
-    if (seat) startGame(getGame(seat.gameId));
+    if (seat) startGame(getGame(seat.gameId), payload?.difficulty ?? "normal");
   });
 
   socket.on("intent", (intent: Intent) => {
@@ -228,29 +226,47 @@ function findSeat(socketId: string): SeatKey | null {
 
 function dispatchIntent(engine: TeamEngine, intent: Intent) {
   switch (intent.type) {
+    // réception
     case "assign_dock":
       return engine.assignDock(intent.truckId, intent.dockId);
-    case "qc_swipe":
-      return engine.qcSwipe(intent.palletId, intent.accept, intent.zone);
+    case "control_line":
+      return engine.controlLine(intent.lineId, intent.accept);
     case "putaway":
-      return engine.putaway(intent.palletId, intent.target);
-    case "transfer":
-      return engine.transfer(intent.skuId);
-    case "start_route":
-      return engine.startRoute(intent.orderId, intent.path);
-    case "flag_ghost":
-      return engine.flagGhost(intent.skuId);
-    case "load_order":
-      return engine.loadOrder(intent.orderId, intent.truckId);
-    case "unload_order":
-      return engine.unloadOrder(intent.orderId);
+      return engine.putaway(intent.taskId, intent.zone);
+    // stock
+    case "replenish_order":
+      return engine.replenishOrder(intent.productId, intent.qty);
+    case "rempotage":
+      return engine.rempotage(intent.palletProductId, intent.slotProductId);
+    case "approche_send":
+      return engine.approcheSend(intent.taskId);
+    case "resolve_anomaly":
+      return engine.resolveAnomaly(intent.anomalyId);
+    // picking
+    case "plan_route":
+      return engine.planRoute(intent.orderId, intent.sequence);
+    case "pick_assign":
+      return engine.pickAssign(intent.orderId, intent.slotProductId, intent.qty);
+    case "stockout_action":
+      return engine.stockoutAction(intent.orderId, intent.productId, intent.action);
+    case "pick_control":
+      return engine.pickControl(intent.orderId, intent.conformMarks);
+    // expédition
+    case "assign_truck":
+      return engine.assignTruck(intent.orderId, intent.truckId);
+    case "unassign_truck":
+      return engine.unassignTruck(intent.orderId);
+    case "pallet_check":
+      return engine.palletCheck(intent.orderId, intent.approve);
+    case "load_item":
+      return engine.loadItem(intent.truckId, intent.orderId);
+    case "close_loading":
+      return engine.closeLoading(intent.truckId);
     case "dispatch_truck":
       return engine.dispatchTruck(intent.truckId);
-    case "alert_picker":
-      return engine.alertPicker(intent.orderId);
   }
 }
 
 httpServer.listen(PORT, () => {
-  console.log(`🏭 The Ripple Effect server listening on :${PORT}`);
+  console.log(`🏭 Warehouse simulator server listening on :${PORT}`);
 });

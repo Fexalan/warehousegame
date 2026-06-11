@@ -1,47 +1,63 @@
 /**
- * Shared domain model for "The Ripple Effect".
+ * Shared domain model for the professional, step-based warehouse simulator.
  * Imported by both server (authoritative engine) and client (rendering).
- *
- * Anti-cheat note: fields the players must *discover* (pallet damage, ghost
- * stock) are intentionally NOT part of these wire types. The server keeps
- * them in private engine state and only the consequences are broadcast.
  */
 
 export type RoleId = "receiver" | "replenisher" | "picker" | "dispatcher";
+export type Difficulty = "easy" | "normal" | "realistic";
 export type AbcZone = "A" | "B" | "C";
-export type Stage = "receiving" | "replenishment" | "picking" | "dispatch";
+export type Stage = "reception" | "stock" | "picking" | "expedition";
+export type Rotation = "haute" | "moyenne" | "faible";
 
 export interface Cell {
   x: number;
   y: number;
 }
 
-export interface Sku {
-  id: string;
+export interface Product {
+  id: string; // "PRD-101"
   name: string;
-  emoji: string;
-  zone: AbcZone; // velocity class -> correct put-away zone
-  cell: Cell; // pick point on the warehouse grid (walkable)
-  unitWeight: number; // kg
-  unitVolume: number; // m3
+  rotation: Rotation; // haute -> zone A, moyenne -> B, faible -> C
+  zone: AbcZone;
+  cell: Cell; // picking location on the warehouse plan
+  unitsPerPallet: number;
+  unitWeight: number; // kg per unit
+  fragile: boolean;
 }
 
-/** Inbound pallet. `cues` are the inspection hints shown on the QC swipe card. */
-export interface Pallet {
+export interface ModeConfig {
+  label: string;
+  description: string;
+  /** false => per-role timers that only run while that role has a backlog (Easy) */
+  globalTimer: boolean;
+  /** true => upstream errors are logged but corrected before reaching the next role */
+  supervisor: boolean;
+  durationMs: number;
+}
+
+// ---------------------------------------------------------------------------
+// RECEPTION
+// ---------------------------------------------------------------------------
+
+/** One line of a delivery, shown against the matching purchase-order line. */
+export interface DeliveryLine {
   id: string;
-  skuId: string;
-  qty: number;
-  cues: string[];
-  status: "on_truck" | "qc" | "buffer" | "stored" | "rejected";
+  orderedProductId: string; // bon de commande
+  orderedQty: number;
+  deliveredProductId: string; // what is physically on the truck
+  deliveredQty: number;
+  conditionNote: string; // inspection observation ("RAS", "Cartons écrasés"...)
+  decision: "pending" | "accepted" | "declined";
 }
 
 export interface InboundTruck {
   id: string;
   label: string;
+  supplier: string;
   arrivedAt: number; // game-relative ms
   dockId: string | null;
   status: "waiting" | "docked" | "departed";
-  pallets: Pallet[];
+  lines: DeliveryLine[];
 }
 
 export interface Dock {
@@ -50,73 +66,141 @@ export interface Dock {
   truckId: string | null;
 }
 
-export interface StockLevel {
-  skuId: string;
-  reserve: number;
-  pick: number; // what the WMS *displays* — a ghost-pallet curveball can make this lie
-  min: number;
-  max: number;
+export interface PutawayTask {
+  id: string;
+  productId: string;
+  qty: number;
+  createdAt: number;
 }
 
-export interface OrderLine {
-  skuId: string;
-  qty: number;
-  picked: number;
+// ---------------------------------------------------------------------------
+// STOCK
+// ---------------------------------------------------------------------------
+
+export interface StockItem {
+  productId: string;
+  reserveUnits: number;
+  pickingUnits: number;
+  /** réapprovisionnement thresholds (reserve, in units) */
+  reserveMin: number;
+  reserveMax: number;
+  /** rempotage thresholds (picking zone, in units) */
+  pickMin: number;
+  pickMax: number;
+  onOrderUnits: number; // ordered from supplier, not yet delivered
 }
+
+export interface TransferJob {
+  productId: string; // destination picking slot
+  units: number;
+  finishAt: number;
+}
+
+export interface ApprocheTask {
+  id: string;
+  orderId: string;
+  orderLabel: string;
+  productId: string;
+  pallets: number;
+  status: "pending" | "done";
+}
+
+// ---------------------------------------------------------------------------
+// PICKING & ORDERS
+// ---------------------------------------------------------------------------
+
+export interface OrderLine {
+  productId: string;
+  qty: number;
+  preparedQty: number;
+  /** realistic mode: what was physically put in the order (may differ) */
+  preparedProductId: string | null;
+  damagedUnits: number;
+  short: boolean; // picker chose to ship partial
+}
+
+export type OrderStatus =
+  | "queued" // awaiting plan de prélèvement
+  | "transit" // picker travelling (duration = planned route distance)
+  | "picking" // assigning products to the order
+  | "control" // contrôle before staging
+  | "staged" // at expedition, awaiting truck assignment
+  | "loaded"
+  | "shipped"
+  | "missed";
 
 export interface Order {
   id: string;
   label: string;
-  clientName: string;
+  client: string;
   destination: string;
-  lines: OrderLine[];
+  priority: "haute" | "normale";
   createdAt: number;
-  deadline: number; // game-relative ms
-  priority: boolean; // rush orders
-  status: "queued" | "picking" | "staged" | "loaded" | "shipped" | "missed";
-  weight: number;
-  volume: number;
-  stockoutFlag: boolean; // picker hit a ghost pallet on this order
-  assignedTruckId: string | null;
+  deadline: number; // ignored for scoring in Easy mode
+  lines: OrderLine[];
+  /** full-pallet requirement satisfied by the Replenisher's "approche" step */
+  fullPallet: { productId: string; pallets: number; fulfilled: boolean } | null;
+  status: OrderStatus;
+  planDistance: number | null;
+  optimalDistance: number | null;
+  transitUntil: number | null;
+  truckId: string | null;
+  /** expedition pallet check performed and approved */
+  expeditionChecked: boolean;
+  /** visible condition problems at control steps (realistic cascade + staging incidents) */
+  defects: string[];
+  weight: number; // total kg
   shippedAt: number | null;
 }
+
+// ---------------------------------------------------------------------------
+// EXPEDITION
+// ---------------------------------------------------------------------------
 
 export interface OutboundTruck {
   id: string;
   label: string;
   destination: string;
-  departsAt: number; // auto-departure deadline (game-relative ms)
   maxWeight: number;
-  maxVolume: number;
+  /** auto-departure (game ms); null in Easy mode (no departure pressure) */
+  departsAt: number | null;
+  assignedOrderIds: string[];
+  /** loading sequence chosen at the chargement step */
   loadedOrderIds: string[];
+  loadingClosed: boolean;
   status: "loading" | "departed";
 }
 
-export interface ActiveRoute {
-  orderId: string;
-  path: Cell[];
-  startedAt: number;
-  finishAt: number;
+// ---------------------------------------------------------------------------
+// SUPERVISOR & ANOMALIES
+// ---------------------------------------------------------------------------
+
+/** Easy/Normal: an upstream error intercepted before it cascaded. */
+export interface SupervisorEvent {
+  at: number;
+  role: RoleId;
+  step: string; // "Contrôle réception", "Rempotage", ...
+  error: string;
+  original: string; // what the player did
+  corrected: string; // what the supervisor passed downstream instead
+  penalty: number;
 }
 
-export interface TransferJob {
-  skuId: string;
-  qty: number;
-  startedAt: number;
-  finishAt: number;
-}
-
-export type CurveballKind = "rush_order" | "damaged_rack" | "ghost_pallet";
-
-export interface Curveball {
+/** Realistic: a propagated problem someone downstream must now handle. */
+export interface Anomaly {
   id: string;
-  kind: CurveballKind;
-  firedAt: number;
-  targets: RoleId[];
-  resolved: boolean;
-  /** kind-specific public payload (rush: orderId, rack: cells+until, ghost: skuId once discovered) */
-  payload: Record<string, unknown>;
+  kind: "slot_mismatch" | "stockout" | "damaged_flow" | "misplaced_pallet";
+  role: RoleId; // who must handle it
+  productId: string | null;
+  orderId: string | null;
+  detail: string;
+  status: "visible" | "resolved";
+  createdAt: number;
 }
+
+// ---------------------------------------------------------------------------
+// TEAM STATE (the wire snapshot)
+// ---------------------------------------------------------------------------
 
 export interface PlayerInfo {
   name: string;
@@ -124,29 +208,39 @@ export interface PlayerInfo {
   connected: boolean;
 }
 
-/** Full team snapshot broadcast to all 4 role screens (each renders its slice). */
+export interface RoleTimer {
+  activeMs: number;
+  running: boolean;
+}
+
 export interface TeamState {
   teamId: string;
   teamName: string;
+  difficulty: Difficulty;
   clock: { now: number; durationMs: number };
+  roleTimers: Record<RoleId, RoleTimer>;
   cost: number;
   shippedCount: number;
   orderCount: number;
+  supervisorCount: number;
+
   docks: Dock[];
   inboundTrucks: InboundTruck[];
-  inboundBuffer: Pallet[];
-  stock: StockLevel[];
+  putawayTasks: PutawayTask[];
+
+  stock: StockItem[];
+  transferJobs: TransferJob[];
+  approcheTasks: ApprocheTask[];
+
   orders: Order[];
   outboundTrucks: OutboundTruck[];
-  blockedCells: Cell[];
-  activeRoute: ActiveRoute | null;
-  transferJobs: TransferJob[];
-  curveballs: Curveball[];
+
+  anomalies: Anomaly[]; // visible, unresolved
   players: PlayerInfo[];
 }
 
 // ---------------------------------------------------------------------------
-// End-of-game educational report
+// End-of-game report
 // ---------------------------------------------------------------------------
 
 export interface CostEvent {
@@ -154,28 +248,30 @@ export interface CostEvent {
   label: string;
   amount: number;
   role: RoleId;
+  supervised: boolean; // intercepted by the supervisor (easy/normal)
 }
 
 export interface HeatmapBucket {
-  /** bucket start, game-relative ms */
   t: number;
-  /** 0..1 pressure per stage (how "backed up" that stage was) */
   pressures: Record<Stage, number>;
-  /** stage that was the bottleneck during this bucket, if any */
   bottleneck: Stage | null;
 }
 
 export interface TeamReport {
   teamId: string;
   teamName: string;
+  difficulty: Difficulty;
   score: number;
   otif: { pct: number; onTimeInFull: number; total: number; shipped: number };
   dockUtilization: { busyPct: number; avgWaitSec: number; maxWaitSec: number; trucksServed: number };
   errorCost: {
     total: number;
     breakdown: { label: string; count: number; amount: number }[];
+    byRole: Record<RoleId, number>;
     log: CostEvent[];
   };
+  supervisor: SupervisorEvent[];
+  roleTimers: Record<RoleId, RoleTimer>;
   heatmap: { bucketMs: number; buckets: HeatmapBucket[] };
   insights: string[];
 }
@@ -192,6 +288,7 @@ export interface LobbyTeam {
 export interface LobbyState {
   gameId: string;
   status: "lobby" | "running" | "over";
+  difficulty: Difficulty;
   teams: LobbyTeam[];
 }
 
@@ -202,16 +299,27 @@ export interface ToastMsg {
 
 /** Client -> server intents. The server validates everything. */
 export type Intent =
+  // reception
   | { type: "assign_dock"; truckId: string; dockId: string }
-  | { type: "qc_swipe"; palletId: string; accept: boolean; zone?: AbcZone }
-  | { type: "putaway"; palletId: string; target: "reserve" | "pick" }
-  | { type: "transfer"; skuId: string }
-  | { type: "start_route"; orderId: string; path: Cell[] }
-  | { type: "flag_ghost"; skuId: string }
-  | { type: "load_order"; orderId: string; truckId: string }
-  | { type: "unload_order"; orderId: string }
-  | { type: "dispatch_truck"; truckId: string }
-  | { type: "alert_picker"; orderId: string };
+  | { type: "control_line"; lineId: string; accept: boolean }
+  | { type: "putaway"; taskId: string; zone: AbcZone }
+  // stock
+  | { type: "replenish_order"; productId: string; qty: number }
+  | { type: "rempotage"; palletProductId: string; slotProductId: string }
+  | { type: "approche_send"; taskId: string }
+  | { type: "resolve_anomaly"; anomalyId: string }
+  // picking
+  | { type: "plan_route"; orderId: string; sequence: string[] }
+  | { type: "pick_assign"; orderId: string; slotProductId: string; qty: number }
+  | { type: "stockout_action"; orderId: string; productId: string; action: "emergency" | "partial" | "postpone" }
+  | { type: "pick_control"; orderId: string; conformMarks: Record<string, boolean> }
+  // expedition
+  | { type: "assign_truck"; orderId: string; truckId: string }
+  | { type: "unassign_truck"; orderId: string }
+  | { type: "pallet_check"; orderId: string; approve: boolean }
+  | { type: "load_item"; truckId: string; orderId: string }
+  | { type: "close_loading"; truckId: string }
+  | { type: "dispatch_truck"; truckId: string };
 
 export interface JoinPayload {
   gameId: string;
@@ -220,6 +328,10 @@ export interface JoinPayload {
   role: RoleId;
 }
 
+export interface StartPayload {
+  difficulty: Difficulty;
+}
+
 export interface GameOverPayload {
-  reports: TeamReport[]; // sorted by score desc
+  reports: TeamReport[];
 }

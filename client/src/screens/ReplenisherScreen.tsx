@@ -1,10 +1,16 @@
 /**
- * Replenisher: min/max watchkeeping. Two loops —
- *   1) inbound buffer: store to reserve OR cross-dock straight to pick face
- *   2) pick-face levels: one-tap transfers before the Picker starves
+ * Stock — 3 étapes :
+ *   1. Réapprovisionnement : tableau stocks / seuils min-max, calculer et
+ *      commander la quantité pour remonter au max
+ *   2. Rempotage : palettes en réserve -> emplacements picking selon les
+ *      quantités (choisir la palette PUIS l'emplacement : l'erreur est possible)
+ *   3. Approche : palettes complètes demandées à quai, à envoyer directement
  */
-import { SKUS, TRANSFER_MS, skuById } from "@shared/constants";
+import { useState } from "react";
+import { PRODUCTS, STEP_LABELS, productById } from "@shared/constants";
 import type { Intent, TeamState } from "@shared/types";
+import { AnomalyPanel } from "../components/AnomalyPanel";
+import { StepTabs } from "../components/StepTabs";
 
 export function ReplenisherScreen({
   state,
@@ -15,82 +21,179 @@ export function ReplenisherScreen({
   send: (i: Intent) => void;
   gameNow: () => number;
 }) {
-  const now = gameNow();
+  const [step, setStep] = useState(0);
+  const [orderQty, setOrderQty] = useState<Record<string, string>>({});
+  const [selectedPallet, setSelectedPallet] = useState<string | null>(null);
+
+  const reapproNeeded = state.stock.filter((s) => s.reserveUnits + s.onOrderUnits < s.reserveMin).length;
+  const rempotageNeeded = state.stock.filter(
+    (s) => s.pickingUnits < s.pickMin && s.reserveUnits >= productById(s.productId).unitsPerPallet
+  ).length;
+  const approchePending = state.approcheTasks.filter((t) => t.status === "pending").length;
 
   return (
-    <main className="screen replenisher">
-      <section className="panel">
-        <h2>📥 Inbound Buffer ({state.inboundBuffer.length})</h2>
-        <div className="buffer-row">
-          {state.inboundBuffer.map((p) => {
-            const sku = skuById(p.skuId);
-            const stock = state.stock.find((s) => s.skuId === p.skuId);
-            const lowPick = stock ? stock.pick < stock.min : false;
-            return (
-              <div key={p.id} className="buffer-card">
-                <b>
-                  {sku.emoji} {sku.name}
-                </b>
-                <span>{p.qty} units · Zone {sku.zone}</span>
-                <div className="buffer-actions">
-                  <button className="btn" onClick={() => send({ type: "putaway", palletId: p.id, target: "reserve" })}>
-                    🏬 Reserve
-                  </button>
-                  <button
-                    className={`btn ${lowPick ? "btn-go" : ""}`}
-                    onClick={() => send({ type: "putaway", palletId: p.id, target: "pick" })}
-                    title="Skip storage, straight to the pick face"
-                  >
-                    ⚡ Cross-dock
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-          {state.inboundBuffer.length === 0 && <p className="muted">Buffer empty — watch the levels below.</p>}
-        </div>
-      </section>
+    <main className="screen column">
+      <StepTabs
+        labels={STEP_LABELS.replenisher}
+        badges={[reapproNeeded, rempotageNeeded, approchePending]}
+        active={step}
+        onSelect={setStep}
+      />
 
-      <section className="panel">
-        <h2>📊 Pick Face Levels (min/max)</h2>
-        <div className="stock-table">
-          {SKUS.map((sku) => {
-            const s = state.stock.find((x) => x.skuId === sku.id)!;
-            const job = state.transferJobs.find((j) => j.skuId === sku.id);
-            const pct = Math.min(100, (s.pick / s.max) * 100);
-            const level = s.pick <= 0 ? "empty" : s.pick < s.min ? "low" : "ok";
-            return (
-              <div key={sku.id} className={`stock-row level-${level}`}>
-                <span className="stock-name">
-                  {sku.emoji} {sku.name}
-                </span>
-                <div className="stock-bar">
-                  <div className={`stock-fill level-${level}`} style={{ width: `${pct}%` }} />
-                  <div className="stock-min" style={{ left: `${(s.min / s.max) * 100}%` }} />
-                  <span className="stock-num">
-                    {s.pick}/{s.max}
-                  </span>
-                </div>
-                <span className="stock-reserve">res {s.reserve}</span>
-                {job ? (
-                  <span className="transfer-progress">
-                    ⏳ {Math.max(0, Math.ceil((job.finishAt - now) / 1000))}s
-                  </span>
-                ) : (
-                  <button
-                    className={`btn ${level !== "ok" ? "btn-go" : ""}`}
-                    disabled={s.reserve <= 0 || s.pick >= s.max}
-                    onClick={() => send({ type: "transfer", skuId: sku.id })}
-                    title={`Move reserve stock to the pick face (${TRANSFER_MS / 1000}s)`}
-                  >
-                    ➜ Transfer
-                  </button>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </section>
+      <AnomalyPanel anomalies={state.anomalies} role="replenisher" send={send} />
+
+      {step === 0 && (
+        <section className="panel">
+          <h2>Réapprovisionnement fournisseur</h2>
+          <p className="hint">Si réserve + en commande &lt; seuil min : commander la quantité qui ramène le stock au max.</p>
+          <table className="pro-table">
+            <thead>
+              <tr><th>Produit</th><th>Réserve</th><th>En commande</th><th>Seuil min</th><th>Seuil max</th><th>Quantité à commander</th><th></th></tr>
+            </thead>
+            <tbody>
+              {state.stock.map((s) => {
+                const under = s.reserveUnits + s.onOrderUnits < s.reserveMin;
+                return (
+                  <tr key={s.productId} className={under ? "row-alert" : ""}>
+                    <td><b>{s.productId}</b><small className="sub">{productById(s.productId).name}</small></td>
+                    <td>{s.reserveUnits} u.</td>
+                    <td>{s.onOrderUnits > 0 ? `${s.onOrderUnits} u.` : "—"}</td>
+                    <td>{s.reserveMin}</td>
+                    <td>{s.reserveMax}</td>
+                    <td>
+                      <input
+                        className="qty-input"
+                        type="number"
+                        min={0}
+                        placeholder="0"
+                        value={orderQty[s.productId] ?? ""}
+                        onChange={(e) => setOrderQty({ ...orderQty, [s.productId]: e.target.value })}
+                      />
+                    </td>
+                    <td>
+                      <button
+                        className={`btn ${under ? "btn-go" : ""}`}
+                        disabled={!orderQty[s.productId]}
+                        onClick={() => {
+                          send({ type: "replenish_order", productId: s.productId, qty: Number(orderQty[s.productId]) });
+                          setOrderQty({ ...orderQty, [s.productId]: "" });
+                        }}
+                      >
+                        Commander
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </section>
+      )}
+
+      {step === 1 && (
+        <section className="panel">
+          <h2>Rempotage réserve → picking</h2>
+          <p className="hint">
+            1) Sélectionnez une palette en réserve. 2) Cliquez l'emplacement picking de destination. Une palette
+            complète = {""}toutes les unités d'un coup : vérifiez le seuil max.
+          </p>
+          <div className="rempotage-grid">
+            <div>
+              <h3>Palettes en réserve</h3>
+              <table className="pro-table">
+                <thead><tr><th>Produit</th><th>Palettes</th><th>Unités / palette</th><th></th></tr></thead>
+                <tbody>
+                  {state.stock.map((s) => {
+                    const p = productById(s.productId);
+                    const pallets = Math.floor(s.reserveUnits / p.unitsPerPallet);
+                    return (
+                      <tr key={s.productId} className={selectedPallet === s.productId ? "on" : ""}>
+                        <td><b>{s.productId}</b><small className="sub">{p.name}</small></td>
+                        <td>{pallets}</td>
+                        <td>{p.unitsPerPallet} u.</td>
+                        <td>
+                          <button className="btn" disabled={pallets === 0} onClick={() => setSelectedPallet(s.productId)}>
+                            {selectedPallet === s.productId ? "Sélectionnée ✓" : "Prendre"}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div>
+              <h3>Emplacements picking {selectedPallet && <span className="hint">→ destination de la palette {selectedPallet}</span>}</h3>
+              <table className="pro-table">
+                <thead><tr><th>Emplacement</th><th>Stock picking</th><th>Min</th><th>Max</th><th></th></tr></thead>
+                <tbody>
+                  {state.stock.map((s) => {
+                    const job = state.transferJobs.find((j) => j.productId === s.productId);
+                    const low = s.pickingUnits < s.pickMin;
+                    return (
+                      <tr key={s.productId} className={low ? "row-alert" : ""}>
+                        <td><b>{s.productId}</b></td>
+                        <td className={low ? "cell-bad" : ""}>{s.pickingUnits} u.</td>
+                        <td>{s.pickMin}</td>
+                        <td>{s.pickMax}</td>
+                        <td>
+                          {job ? (
+                            <span className="tag">⏳ {Math.max(0, Math.ceil((job.finishAt - gameNow()) / 1000))} s</span>
+                          ) : (
+                            <button
+                              className={`btn ${low && selectedPallet === s.productId ? "btn-go" : ""}`}
+                              disabled={!selectedPallet}
+                              onClick={() => {
+                                if (selectedPallet) {
+                                  send({ type: "rempotage", palletProductId: selectedPallet, slotProductId: s.productId });
+                                  setSelectedPallet(null);
+                                }
+                              }}
+                            >
+                              Rempoter ici
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {step === 2 && (
+        <section className="panel">
+          <h2>Approche — palettes complètes demandées à quai</h2>
+          <table className="pro-table">
+            <thead><tr><th>Commande</th><th>Produit</th><th>Palettes</th><th>Réserve dispo</th><th></th></tr></thead>
+            <tbody>
+              {state.approcheTasks.filter((t) => t.status === "pending").map((t) => {
+                const p = productById(t.productId);
+                const s = state.stock.find((x) => x.productId === t.productId)!;
+                const needed = p.unitsPerPallet * t.pallets;
+                const ok = s.reserveUnits >= needed;
+                return (
+                  <tr key={t.id} className={ok ? "" : "row-alert"}>
+                    <td><b>{t.orderLabel}</b></td>
+                    <td><b>{t.productId}</b><small className="sub">{p.name}</small></td>
+                    <td>{t.pallets} ({needed} u.)</td>
+                    <td className={ok ? "" : "cell-bad"}>{s.reserveUnits} u.</td>
+                    <td>
+                      <button className="btn btn-go" disabled={!ok} onClick={() => send({ type: "approche_send", taskId: t.id })}>
+                        Envoyer au quai
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+              {approchePending === 0 && <tr><td colSpan={5} className="muted">Aucune demande d'approche en attente.</td></tr>}
+            </tbody>
+          </table>
+        </section>
+      )}
     </main>
   );
 }

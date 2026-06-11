@@ -1,51 +1,59 @@
 /**
- * TeamEngine — the authoritative simulation for ONE team.
+ * TeamEngine — authoritative simulation for ONE team.
  *
- * Clients never mutate state. They send *intents* ("swipe pallet P right",
- * "run route R for order O"); the engine validates, mutates, and the new
- * snapshot is broadcast to the whole team. That single rule is what makes
- * the asymmetric ripple effect work: a slow Receiver is *visible* to the
- * Picker because they share one source of truth.
+ * Clients send *intents*; the engine validates, mutates, broadcasts.
+ *
+ * Error handling is mode-dependent and runs through ONE choke point,
+ * `fault()`:
+ *   - Easy/Normal ("supervisor" modes): the error is charged & logged for the
+ *     offending player, then the CORRECTED effect is applied so downstream
+ *     roles receive sanitized data.
+ *   - Realistic: the RAW effect is applied; consequences propagate as
+ *     `Anomaly` objects the downstream role must discover and handle.
  */
 import {
+  APPROCHE_MS,
   COSTS,
-  DEPOT,
-  GAME_DURATION_MS,
+  CostKey,
   HEATMAP_BUCKET_MS,
+  MODES,
   MS_PER_CELL,
-  PICK_MS_PER_LINE,
-  RACK_BLOCK_CLUSTERS,
-  SKUS,
-  STAGING,
+  PRODUCTS,
+  REAPPRO_LEAD_MS,
+  REPREP_MS,
+  ROLES,
+  STARVATION_GRACE_MS,
+  TICK_MS,
   TRANSFER_MS,
-  TRUCK_RESPAWN_MS,
   TRUCK_WAIT_CHARGE_MS,
-  cellEq,
-  cellKey,
-  isWalkable,
-  skuById,
+  productById,
 } from "../../shared/constants";
+import { optimalTour, tourDistance } from "../../shared/grid";
 import type {
   AbcZone,
-  ActiveRoute,
-  Cell,
+  Anomaly,
+  ApprocheTask,
   CostEvent,
-  Curveball,
-  CurveballKind,
+  DeliveryLine,
+  Difficulty,
   Dock,
   InboundTruck,
+  ModeConfig,
   Order,
+  OrderLine,
   OutboundTruck,
-  Pallet,
   PlayerInfo,
+  PutawayTask,
   RoleId,
+  RoleTimer,
   Stage,
-  StockLevel,
+  StockItem,
+  SupervisorEvent,
   TeamState,
   TransferJob,
 } from "../../shared/types";
-import { Rng, intBetween, mulberry32, pick } from "./rng";
-import { OutboundSpec, Scenario, generateScenario } from "./scenario";
+import { Rng, mulberry32 } from "./rng";
+import { DeliveryLineSpec, Scenario, generateScenario } from "./scenario";
 
 export interface RoleToast {
   role: RoleId | "all";
@@ -53,10 +61,8 @@ export interface RoleToast {
   severity: "info" | "warn" | "alert";
 }
 
-/** Per-tick output the socket layer routes to the right role channels. */
 export interface TickEffects {
   toasts: RoleToast[];
-  curveballs: Curveball[];
   gameOver: boolean;
 }
 
@@ -68,29 +74,42 @@ interface BucketAcc {
 export class TeamEngine {
   readonly teamId: string;
   readonly teamName: string;
+  readonly difficulty: Difficulty;
+  readonly mode: ModeConfig;
   players: PlayerInfo[] = [];
 
-  // ----- public world state (serialized into TeamState) -----
+  // ----- public world state -----
   now = 0;
   cost = 0;
   docks: Dock[] = [
-    { id: "d1", label: "Dock 1", truckId: null },
-    { id: "d2", label: "Dock 2", truckId: null },
+    { id: "d1", label: "Quai 1", truckId: null },
+    { id: "d2", label: "Quai 2", truckId: null },
   ];
   inboundTrucks: InboundTruck[] = [];
-  inboundBuffer: Pallet[] = [];
-  stock: StockLevel[];
+  putawayTasks: PutawayTask[] = [];
+  stock: StockItem[];
+  transferJobs: TransferJob[] = [];
+  approcheTasks: ApprocheTask[] = [];
   orders: Order[] = [];
   outboundTrucks: OutboundTruck[] = [];
-  blockedCells: Cell[] = [];
-  activeRoute: ActiveRoute | null = null;
-  transferJobs: TransferJob[] = [];
-  curveballs: Curveball[] = [];
+  anomalies: Anomaly[] = [];
+  supervisorEvents: SupervisorEvent[] = [];
+  roleTimers: Record<RoleId, RoleTimer> = {
+    receiver: { activeMs: 0, running: false },
+    replenisher: { activeMs: 0, running: false },
+    picker: { activeMs: 0, running: false },
+    dispatcher: { activeMs: 0, running: false },
+  };
 
-  // ----- private truth the players must discover -----
-  private damagedPallets = new Set<string>();
-  private ghostSkuId: string | null = null; // WMS shows stock, location is empty
-  private ghostDiscovered = false;
+  // ----- private truth (never serialized) -----
+  private damagedLines = new Set<string>(); // delivery lines physically damaged
+  private slotPhysical = new Map<string, string>(); // slotProductId -> actual productId
+  private slotRevealed = new Set<string>(); // mismatched slots the picker discovered
+  private misplacedReserve = new Set<string>(); // productId stored in wrong ABC zone
+  private damagedReserve = new Map<string, number>(); // productId -> damaged units (realistic)
+  private damagedPicking = new Map<string, number>();
+  private starvedSince = new Map<string, number>();
+  private stagingIncidents = new Set<string>(); // order ids that get a staging defect
 
   // ----- scenario & bookkeeping -----
   private scenario: Scenario;
@@ -98,14 +117,16 @@ export class TeamEngine {
   private nextTruckIdx = 0;
   private nextOrderIdx = 0;
   private nextOutboundIdx = 0;
-  private nextCurveballIdx = 0;
   private outboundRespawnAt: number[] = [];
-  private rackBlockUntil = 0;
+  private pendingReappro: { lines: DeliveryLineSpec[]; firstAt: number } | null = null;
+  private dynamicTrucks: { at: number; lines: DeliveryLineSpec[] }[] = [];
+  private reprepJobs: { orderId: string; finishAt: number }[] = [];
+  private scheduled: { at: number; fn: () => void }[] = [];
   private idCounter = 0;
-  private truckWaitCharged = new Map<string, number>(); // truckId -> ms already billed
+  private truckWaitCharged = new Map<string, number>();
   private prevNow = 0;
 
-  // ----- analytics (consumed by kpi.ts) -----
+  // ----- analytics -----
   costLog: CostEvent[] = [];
   dockBusyMs = 0;
   truckWaitsMs: number[] = [];
@@ -113,21 +134,35 @@ export class TeamEngine {
   wrongDestOrders = new Set<string>();
   buckets = new Map<number, BucketAcc>();
 
-  private effects: TickEffects = { toasts: [], curveballs: [], gameOver: false };
+  private effects: TickEffects = { toasts: [], gameOver: false };
 
-  constructor(teamId: string, teamName: string, seed: number) {
+  constructor(teamId: string, teamName: string, seed: number, difficulty: Difficulty) {
     this.teamId = teamId;
     this.teamName = teamName;
-    this.scenario = generateScenario(seed);
-    // Engine-local rng (curveball target picks); offset so it diverges from scenario gen.
+    this.difficulty = difficulty;
+    this.mode = MODES[difficulty];
+    this.scenario = generateScenario(seed, difficulty);
     this.rng = mulberry32(seed ^ 0x9e3779b9);
-    this.stock = SKUS.map((s) => ({ skuId: s.id, reserve: 60, pick: 25, min: 12, max: 40 }));
-    // Three loading bays: with three destinations in play, dispatch should be
-    // a planning problem, not a lottery.
+    this.stock = PRODUCTS.map((p) => ({
+      productId: p.id,
+      reserveUnits: p.unitsPerPallet * 2,
+      pickingUnits: Math.round(p.unitsPerPallet * 0.9),
+      reserveMin: p.unitsPerPallet * 2, // several products start AT min: réappro has work
+      reserveMax: p.unitsPerPallet * 5,
+      pickMin: Math.round(p.unitsPerPallet * 0.5),
+      pickMax: p.unitsPerPallet * 2,
+      onOrderUnits: 0,
+    }));
+    // Stagger initial reserves so 3-4 products are already below min.
+    for (let i = 0; i < this.stock.length; i++) {
+      if (i % 2 === 0) this.stock[i].reserveUnits -= Math.round(PRODUCTS[i].unitsPerPallet * 1.2);
+    }
     this.spawnOutbound(0);
     this.spawnOutbound(0);
     this.spawnOutbound(0);
   }
+
+  // ----- helpers -----
 
   private newId(prefix: string): string {
     return `${prefix}-${this.teamId}-${++this.idCounter}`;
@@ -137,158 +172,293 @@ export class TeamEngine {
     this.effects.toasts.push({ role, message, severity });
   }
 
-  private charge(key: keyof typeof COSTS, role: RoleId, detail?: string) {
+  private charge(key: CostKey, role: RoleId, detail?: string, supervised = false) {
     const { label, amount } = COSTS[key];
     this.cost += amount;
-    this.costLog.push({ at: this.now, label: detail ? `${label} — ${detail}` : label, amount, role });
+    this.costLog.push({
+      at: this.now,
+      label: detail ? `${label} — ${detail}` : label,
+      amount,
+      role,
+      supervised,
+    });
   }
 
-  private stockOf(skuId: string): StockLevel {
-    const s = this.stock.find((x) => x.skuId === skuId);
-    if (!s) throw new Error(`Unknown SKU ${skuId}`);
+  /**
+   * THE SUPERVISOR CHOKE POINT.
+   * Logs the error against the offending role, then applies either the
+   * corrected effect (Easy/Normal) or lets the raw mistake cascade
+   * (Realistic).
+   */
+  private fault(
+    key: CostKey,
+    role: RoleId,
+    step: string,
+    original: string,
+    corrected: string,
+    onCorrect: () => void,
+    onCascade: () => void
+  ) {
+    this.charge(key, role, undefined, this.mode.supervisor);
+    if (this.mode.supervisor) {
+      this.supervisorEvents.push({
+        at: this.now,
+        role,
+        step,
+        error: COSTS[key].label,
+        original,
+        corrected,
+        penalty: COSTS[key].amount,
+      });
+      onCorrect();
+    } else {
+      onCascade();
+    }
+  }
+
+  private addAnomaly(kind: Anomaly["kind"], role: RoleId, detail: string, productId: string | null = null, orderId: string | null = null): Anomaly {
+    const a: Anomaly = {
+      id: this.newId("ano"),
+      kind,
+      role,
+      productId,
+      orderId,
+      detail,
+      status: "visible",
+      createdAt: this.now,
+    };
+    this.anomalies.push(a);
+    this.toast(role, `⚠ Anomalie : ${detail}`, "alert");
+    return a;
+  }
+
+  private stockOf(productId: string): StockItem {
+    const s = this.stock.find((x) => x.productId === productId);
+    if (!s) throw new Error(`Produit inconnu ${productId}`);
     return s;
   }
 
+  private orderOf(orderId: string): Order {
+    const o = this.orders.find((x) => x.id === orderId);
+    if (!o) throw new Error("Commande inconnue");
+    return o;
+  }
+
+  private orderFragile(o: Order): boolean {
+    return o.lines.some((l) => productById(l.productId).fragile);
+  }
+
   // =========================================================================
-  // TICK — the continuous-flow heartbeat (4 Hz)
+  // TICK
   // =========================================================================
 
   tick(now: number): TickEffects {
-    this.effects = { toasts: [], curveballs: [], gameOver: false };
+    this.effects = { toasts: [], gameOver: false };
     const dt = now - this.prevNow;
     this.prevNow = now;
     this.now = now;
 
     this.spawnDueTrucks();
     this.spawnDueOrders();
-    this.fireDueCurveballs();
+    this.flushPendingReappro();
     this.completeDueJobs();
+    this.watchStarvation();
     this.departDueOutbound();
-    this.accrueTruckWaitCosts();
-    this.clearExpiredRackBlock();
+    if (this.mode.globalTimer) this.accrueTruckWaitCosts();
     this.dockBusyMs += dt * this.docks.filter((d) => d.truckId).length;
+    this.updateRoleTimers(dt);
     this.sampleTelemetry();
 
-    if (now >= GAME_DURATION_MS) {
+    if (this.isOver()) {
       this.finalizePenalties();
       this.effects.gameOver = true;
     }
     return this.effects;
   }
 
+  private isOver(): boolean {
+    if (this.now >= this.mode.durationMs) return true;
+    if (this.mode.globalTimer) return false;
+    // Easy: ends when the whole workload is processed.
+    const spawnsDone =
+      this.nextTruckIdx >= this.scenario.trucks.length &&
+      this.nextOrderIdx >= this.scenario.orders.length &&
+      this.dynamicTrucks.length === 0 &&
+      !this.pendingReappro;
+    const workDone =
+      this.inboundTrucks.length === 0 &&
+      this.putawayTasks.length === 0 &&
+      this.approcheTasks.every((t) => t.status === "done") &&
+      this.orders.length > 0 &&
+      this.orders.every((o) => o.status === "shipped" || o.status === "missed");
+    return spawnsDone && workDone;
+  }
+
+  // ----- spawning -----
+
   private spawnDueTrucks() {
-    while (
-      this.nextTruckIdx < this.scenario.trucks.length &&
-      this.scenario.trucks[this.nextTruckIdx].at <= this.now
-    ) {
+    while (this.nextTruckIdx < this.scenario.trucks.length && this.scenario.trucks[this.nextTruckIdx].at <= this.now) {
       const spec = this.scenario.trucks[this.nextTruckIdx++];
-      const truck: InboundTruck = {
-        id: this.newId("itrk"),
-        label: `TRK-${10 + this.nextTruckIdx}`,
-        arrivedAt: this.now,
-        dockId: null,
-        status: "waiting",
-        pallets: spec.pallets.map((p) => {
-          const pallet: Pallet = {
-            id: this.newId("plt"),
-            skuId: p.skuId,
-            qty: p.qty,
-            cues: p.cues,
-            status: "on_truck",
-          };
-          if (p.damaged) this.damagedPallets.add(pallet.id);
-          return pallet;
-        }),
-      };
-      this.inboundTrucks.push(truck);
-      this.toast("receiver", `${truck.label} arrived in the yard (${truck.pallets.length} pallets)`, "info");
+      this.spawnInbound(spec.supplier, spec.lines);
     }
+    this.dynamicTrucks = this.dynamicTrucks.filter((t) => {
+      if (t.at > this.now) return true;
+      this.spawnInbound("Réappro fournisseur", t.lines);
+      for (const l of t.lines) this.stockOf(l.productId).onOrderUnits -= l.orderedQty;
+      return false;
+    });
+  }
+
+  private spawnInbound(supplier: string, lines: DeliveryLineSpec[]) {
+    const truck: InboundTruck = {
+      id: this.newId("itrk"),
+      label: `LIV-${100 + ++this.idCounter}`,
+      supplier,
+      arrivedAt: this.now,
+      dockId: null,
+      status: "waiting",
+      lines: lines.map((l) => {
+        const line: DeliveryLine = {
+          id: this.newId("lin"),
+          orderedProductId: l.productId,
+          orderedQty: l.orderedQty,
+          deliveredProductId: l.deliveredProductId,
+          deliveredQty: l.deliveredQty,
+          conditionNote: l.conditionNote,
+          decision: "pending",
+        };
+        if (l.damaged) this.damagedLines.add(line.id);
+        return line;
+      }),
+    };
+    this.inboundTrucks.push(truck);
+    this.toast("receiver", `${truck.label} (${supplier}) arrivé sur le parc — ${truck.lines.length} lignes`, "info");
   }
 
   private spawnDueOrders() {
-    while (
-      this.nextOrderIdx < this.scenario.orders.length &&
-      this.scenario.orders[this.nextOrderIdx].at <= this.now
-    ) {
+    while (this.nextOrderIdx < this.scenario.orders.length && this.scenario.orders[this.nextOrderIdx].at <= this.now) {
       const spec = this.scenario.orders[this.nextOrderIdx++];
-      this.createOrder(spec.clientName, spec.destination, spec.lines, spec.deadline, false);
+      const lines: OrderLine[] = spec.lines.map((l) => ({
+        productId: l.productId,
+        qty: l.qty,
+        preparedQty: 0,
+        preparedProductId: null,
+        damagedUnits: 0,
+        short: false,
+      }));
+      const weight = Math.round(
+        lines.reduce((a, l) => a + productById(l.productId).unitWeight * l.qty, 0) +
+          (spec.fullPallet
+            ? productById(spec.fullPallet.productId).unitWeight *
+              productById(spec.fullPallet.productId).unitsPerPallet *
+              spec.fullPallet.pallets
+            : 0)
+      );
+      const order: Order = {
+        id: this.newId("ord"),
+        label: `CMD-${200 + this.orders.length + 1}`,
+        client: spec.client,
+        destination: spec.destination,
+        priority: spec.priority,
+        createdAt: this.now,
+        deadline: spec.deadline,
+        lines,
+        fullPallet: spec.fullPallet ? { ...spec.fullPallet, fulfilled: false } : null,
+        status: "queued",
+        planDistance: null,
+        optimalDistance: null,
+        transitUntil: null,
+        truckId: null,
+        expeditionChecked: false,
+        defects: [],
+        weight,
+        shippedAt: null,
+      };
+      this.orders.push(order);
+      if (spec.stagingIncident) this.stagingIncidents.add(order.id);
+      if (spec.fullPallet) {
+        this.approcheTasks.push({
+          id: this.newId("app"),
+          orderId: order.id,
+          orderLabel: order.label,
+          productId: spec.fullPallet.productId,
+          pallets: spec.fullPallet.pallets,
+          status: "pending",
+        });
+        this.toast("replenisher", `Approche demandée : ${spec.fullPallet.pallets} palette(s) ${spec.fullPallet.productId} pour ${order.label}`, "info");
+      }
+      this.toast("picker", `Nouvelle commande ${order.label} (${spec.client})${spec.priority === "haute" ? " — PRIORITÉ HAUTE" : ""}`, spec.priority === "haute" ? "warn" : "info");
     }
-  }
-
-  private createOrder(
-    clientName: string,
-    destination: string,
-    lines: { skuId: string; qty: number }[],
-    deadline: number,
-    priority: boolean
-  ): Order {
-    let weight = 0;
-    let volume = 0;
-    for (const l of lines) {
-      const sku = skuById(l.skuId);
-      weight += sku.unitWeight * l.qty;
-      volume += sku.unitVolume * l.qty;
-    }
-    const order: Order = {
-      id: this.newId("ord"),
-      label: `#${100 + this.orders.length + 1}`,
-      clientName,
-      destination,
-      lines: lines.map((l) => ({ ...l, picked: 0 })),
-      createdAt: this.now,
-      deadline,
-      priority,
-      status: "queued",
-      weight: Math.round(weight),
-      volume: Math.round(volume * 100) / 100,
-      stockoutFlag: false,
-      assignedTruckId: null,
-      shippedAt: null,
-    };
-    this.orders.push(order);
-    if (!priority) this.toast("picker", `New order ${order.label} from ${clientName}`, "info");
-    return order;
   }
 
   private spawnOutbound(at: number) {
-    const spec: OutboundSpec =
-      this.scenario.outbound[Math.min(this.nextOutboundIdx++, this.scenario.outbound.length - 1)];
+    // Cycle the seeded profiles so every destination keeps reappearing.
+    const spec = this.scenario.outbound[this.nextOutboundIdx++ % this.scenario.outbound.length];
     this.outboundTrucks.push({
       id: this.newId("otrk"),
-      label: `OUT-${20 + this.nextOutboundIdx}`,
+      label: `EXP-${300 + this.nextOutboundIdx}`,
       destination: spec.destination,
-      departsAt: at + spec.lifeMs,
       maxWeight: spec.maxWeight,
-      maxVolume: Math.round(spec.maxVolume * 100) / 100,
+      departsAt: this.mode.globalTimer ? at + spec.lifeMs : null,
+      assignedOrderIds: [],
       loadedOrderIds: [],
+      loadingClosed: false,
       status: "loading",
     });
   }
 
+  private flushPendingReappro() {
+    if (!this.pendingReappro) return;
+    const p = this.pendingReappro;
+    if (p.lines.length >= 3 || this.now - p.firstAt > 12_000) {
+      this.dynamicTrucks.push({ at: this.now + REAPPRO_LEAD_MS, lines: p.lines });
+      this.pendingReappro = null;
+    }
+  }
+
+  // ----- job completion -----
+
+  private schedule(delayMs: number, fn: () => void) {
+    this.scheduled.push({ at: this.now + delayMs, fn });
+  }
+
   private completeDueJobs() {
-    // Replenishment transfers landing
+    this.scheduled = this.scheduled.filter((job) => {
+      if (job.at > this.now) return true;
+      job.fn();
+      return false;
+    });
+
+    // rempotage transfers landing in picking
     for (const job of [...this.transferJobs]) {
       if (job.finishAt > this.now) continue;
       this.transferJobs = this.transferJobs.filter((j) => j !== job);
-      const s = this.stockOf(job.skuId);
-      if (this.ghostSkuId === job.skuId && !this.ghostDiscovered) {
-        // Physical stock arrives before anyone noticed the discrepancy:
-        // the transferred qty IS the real on-hand now. Quietly self-heals.
-        s.pick = job.qty;
-        this.resolveGhost(false);
-      } else {
-        s.pick += job.qty;
+      const s = this.stockOf(job.productId);
+      s.pickingUnits += job.units;
+      this.toast("replenisher", `Rempotage terminé : +${job.units} u. ${job.productId} en picking`, "info");
+    }
+
+    // picker transit -> picking
+    for (const o of this.orders) {
+      if (o.status === "transit" && o.transitUntil !== null && o.transitUntil <= this.now) {
+        o.status = "picking";
+        this.toast("picker", `${o.label} : arrivé en zone — prélèvement possible`, "info");
       }
-      this.toast("replenisher", `Transfer done: +${job.qty} ${skuById(job.skuId).name} to pick face`, "info");
     }
 
-    // Picker route landing
-    if (this.activeRoute && this.activeRoute.finishAt <= this.now) {
-      this.completeRoute(this.activeRoute);
-      this.activeRoute = null;
-    }
+    // expedition re-preparation after a refusal
+    this.reprepJobs = this.reprepJobs.filter((j) => {
+      if (j.finishAt > this.now) return true;
+      const o = this.orders.find((x) => x.id === j.orderId);
+      if (o) {
+        o.defects = [];
+        o.expeditionChecked = false;
+        this.toast("dispatcher", `${o.label} re-préparée — à recontrôler`, "info");
+      }
+      return false;
+    });
 
-    // Outbound truck respawns
+    // outbound bay respawns
     this.outboundRespawnAt = this.outboundRespawnAt.filter((at) => {
       if (at > this.now) return true;
       this.spawnOutbound(this.now);
@@ -296,78 +466,77 @@ export class TeamEngine {
     });
   }
 
-  private completeRoute(route: ActiveRoute) {
-    const order = this.orders.find((o) => o.id === route.orderId);
-    if (!order) return;
-    for (const line of order.lines) {
-      const need = line.qty - line.picked;
-      if (need <= 0) continue;
-      const s = this.stockOf(line.skuId);
-      if (this.ghostSkuId === line.skuId && !this.ghostDiscovered) {
-        // The WMS lied. The picker just found an empty location.
-        this.ghostDiscovered = true;
-        order.stockoutFlag = true;
-        const cb = this.curveballs.find((c) => c.kind === "ghost_pallet" && !c.resolved);
-        if (cb) {
-          cb.targets = ["picker"];
-          cb.payload = { skuId: line.skuId, displayed: s.pick };
-          this.effects.curveballs.push(cb);
-        }
-        this.toast(
-          "picker",
-          `GHOST PALLET! System shows ${s.pick} × ${skuById(line.skuId).name} but the location is EMPTY. Flag the discrepancy!`,
-          "alert"
-        );
+  /** Rempotage inaction: picking below min with a full pallet available. */
+  private watchStarvation() {
+    for (const s of this.stock) {
+      const p = productById(s.productId);
+      const needs = s.pickingUnits < s.pickMin && s.reserveUnits >= p.unitsPerPallet && !this.transferJobs.some((j) => j.productId === s.productId);
+      if (!needs) {
+        this.starvedSince.delete(s.productId);
         continue;
       }
-      const take = Math.min(need, s.pick);
-      s.pick -= take;
-      line.picked += take;
-      if (take < need) order.stockoutFlag = true;
-    }
-    const complete = order.lines.every((l) => l.picked >= l.qty);
-    if (complete) {
-      order.status = "staged";
-      order.stockoutFlag = false;
-      this.toast("dispatcher", `Order ${order.label} staged — ${order.destination}, ${order.weight}kg`, "info");
-    } else {
-      order.status = "queued"; // back to the queue: re-pick once stock is fixed
-      this.toast("picker", `Order ${order.label} incomplete — stock-out. Back in queue.`, "warn");
+      const since = this.starvedSince.get(s.productId) ?? this.now;
+      this.starvedSince.set(s.productId, since);
+      if (this.now - since < STARVATION_GRACE_MS) continue;
+      this.starvedSince.set(s.productId, this.now); // re-arm
+      this.fault(
+        "pickingStarved",
+        "replenisher",
+        "Rempotage",
+        `Picking ${s.productId} sous le seuil min (${s.pickingUnits}/${s.pickMin}) sans rempotage`,
+        `Le superviseur a rempoté 1 palette de ${s.productId}`,
+        () => {
+          s.reserveUnits -= p.unitsPerPallet;
+          s.pickingUnits += p.unitsPerPallet;
+        },
+        () => {
+          // Realistic: nothing moves — the Picker will hit the stock-out.
+        }
+      );
     }
   }
 
   private departDueOutbound() {
     for (const truck of this.outboundTrucks.filter((t) => t.status === "loading")) {
-      if (truck.departsAt <= this.now) this.departTruck(truck, true);
+      if (truck.departsAt !== null && truck.departsAt <= this.now) this.departTruck(truck, true);
     }
   }
 
   private departTruck(truck: OutboundTruck, auto: boolean) {
     truck.status = "departed";
+    // Assigned but never loaded: left on the quai.
+    for (const oid of truck.assignedOrderIds.filter((id) => !truck.loadedOrderIds.includes(id))) {
+      const o = this.orders.find((x) => x.id === oid);
+      if (o && o.status !== "shipped") {
+        o.truckId = null;
+        o.status = "staged";
+        this.toast("dispatcher", `${o.label} restée à quai — ${truck.label} est parti sans elle !`, "warn");
+      }
+    }
     let shipped = 0;
     for (const oid of truck.loadedOrderIds) {
-      const order = this.orders.find((o) => o.id === oid);
-      if (!order) continue;
-      order.status = "shipped";
-      order.shippedAt = this.now;
+      const o = this.orders.find((x) => x.id === oid);
+      if (!o) continue;
+      o.status = "shipped";
+      o.shippedAt = this.now;
       shipped++;
-      if (this.now > order.deadline) this.charge("lateShipment", "dispatcher", order.label);
-      if (order.destination !== truck.destination) {
-        this.wrongDestOrders.add(order.id);
-        this.charge("wrongDestination", "dispatcher", `${order.label} → ${truck.destination}`);
+      if (this.mode.globalTimer && this.now > o.deadline) this.charge("lateShipment", "dispatcher", o.label);
+      if (o.destination !== truck.destination) {
+        this.wrongDestOrders.add(o.id);
+        if (!this.mode.supervisor) this.charge("wrongDestination", "dispatcher", `${o.label} → ${truck.destination}`);
       }
-      const rush = this.curveballs.find(
-        (c) => c.kind === "rush_order" && !c.resolved && c.payload.orderId === order.id
-      );
-      if (rush) rush.resolved = true;
+      if (!this.mode.supervisor) {
+        if (o.defects.length > 0) this.charge("shippedDamaged", "dispatcher", o.label);
+        if (o.lines.some((l) => l.short || l.preparedQty < l.qty)) this.charge("shippedIncomplete", "picker", o.label);
+      }
     }
     this.outboundTrucks = this.outboundTrucks.filter((t) => t !== truck);
-    this.outboundRespawnAt.push(this.now + TRUCK_RESPAWN_MS);
+    this.outboundRespawnAt.push(this.now + 8_000);
     this.toast(
       "dispatcher",
       auto
-        ? `${truck.label} left on schedule with ${shipped} order(s)${shipped === 0 ? " — EMPTY truck!" : ""}`
-        : `${truck.label} dispatched with ${shipped} order(s)`,
+        ? `${truck.label} parti à l'heure avec ${shipped} commande(s)${shipped === 0 ? " — camion VIDE !" : ""}`
+        : `${truck.label} expédié avec ${shipped} commande(s)`,
       auto && shipped === 0 ? "warn" : "info"
     );
   }
@@ -383,348 +552,723 @@ export class TeamEngine {
     }
   }
 
-  private clearExpiredRackBlock() {
-    if (this.blockedCells.length > 0 && this.now >= this.rackBlockUntil) {
-      this.blockedCells = [];
-      const cb = this.curveballs.find((c) => c.kind === "damaged_rack" && !c.resolved);
-      if (cb) cb.resolved = true;
-      this.toast("picker", "Aisle cleared — all routes open again", "info");
-    }
-  }
-
   private finalizePenalties() {
-    for (const order of this.orders) {
-      if (order.status !== "shipped" && this.now > order.deadline) {
-        order.status = "missed";
-        this.charge("missedOrder", "dispatcher", order.label);
-      }
-    }
-    for (const truck of this.inboundTrucks.filter((t) => t.status === "waiting")) {
-      this.truckWaitsMs.push(this.now - truck.arrivedAt);
-    }
-  }
-
-  // =========================================================================
-  // CURVEBALL INJECTOR — seeded schedule, role-targeted broadcast
-  // =========================================================================
-
-  private fireDueCurveballs() {
-    while (
-      this.nextCurveballIdx < this.scenario.curveballs.length &&
-      this.scenario.curveballs[this.nextCurveballIdx].at <= this.now
-    ) {
-      const spec = this.scenario.curveballs[this.nextCurveballIdx++];
-      this.fireCurveball(spec.kind);
-    }
-  }
-
-  private fireCurveball(kind: CurveballKind) {
-    const cb: Curveball = {
-      id: this.newId("cb"),
-      kind,
-      firedAt: this.now,
-      targets: [],
-      resolved: false,
-      payload: {},
-    };
-
-    switch (kind) {
-      case "rush_order": {
-        // VIP order with a brutal deadline. Destination matches the freshest
-        // outbound truck so dispatch IS feasible — if the team reacts fast.
-        const truck = [...this.outboundTrucks]
-          .filter((t) => t.status === "loading")
-          .sort((a, b) => b.departsAt - a.departsAt)[0];
-        const destination = truck ? truck.destination : "Lyon";
-        const sku = pick(this.rng, this.stock.filter((s) => s.pick >= 8).map((s) => s.skuId)) ?? "a1";
-        const order = this.createOrder(
-          "VIP — MegaCorp",
-          destination,
-          [{ skuId: sku, qty: intBetween(this.rng, 4, 8) }],
-          this.now + 45_000,
-          true
-        );
-        cb.targets = ["dispatcher", "picker"];
-        cb.payload = { orderId: order.id, label: order.label, deadline: order.deadline };
-        this.toast("dispatcher", `🚨 RUSH ORDER ${order.label} (VIP) — ships to ${destination} in 45s. Alert your picker!`, "alert");
-        break;
-      }
-      case "damaged_rack": {
-        const cluster = pick(this.rng, RACK_BLOCK_CLUSTERS);
-        this.blockedCells = [...cluster];
-        this.rackBlockUntil = this.now + 75_000;
-        cb.targets = ["picker"];
-        cb.payload = { cells: cluster, until: this.rackBlockUntil };
-        // Ripple: if the current route crosses the wreck, it dies instantly.
-        if (this.activeRoute) {
-          const blocked = new Set(cluster.map(cellKey));
-          if (this.activeRoute.path.some((c) => blocked.has(cellKey(c)))) {
-            const order = this.orders.find((o) => o.id === this.activeRoute!.orderId);
-            if (order) order.status = "queued";
-            this.activeRoute = null;
-            this.toast("picker", "💥 Forklift accident! Your route crosses the wreck — REDRAW NOW.", "alert");
-          } else {
-            this.toast("picker", "💥 Forklift accident — an aisle is blocked for 75s.", "alert");
-          }
-        } else {
-          this.toast("picker", "💥 Forklift accident — an aisle is blocked for 75s.", "alert");
+    if (this.mode.globalTimer) {
+      for (const o of this.orders) {
+        if (o.status !== "shipped") {
+          o.status = "missed";
+          this.charge("missedOrder", "dispatcher", o.label);
         }
-        break;
-      }
-      case "ghost_pallet": {
-        // Silent sabotage: the WMS keeps displaying stock for a SKU whose
-        // location is physically empty. Nobody is told — the Picker will
-        // discover it mid-route and must flag it to the Replenisher.
-        const candidates = this.stock.filter((s) => s.pick >= 8 && s.skuId !== this.ghostSkuId);
-        if (candidates.length === 0) return; // nothing worth haunting
-        this.ghostSkuId = pick(this.rng, candidates).skuId;
-        this.ghostDiscovered = false;
-        // targets stay [] => invisible in client state until discovered
-        break;
       }
     }
-
-    this.curveballs.push(cb);
-    if (cb.targets.length > 0) this.effects.curveballs.push(cb);
+    for (const t of this.inboundTrucks.filter((x) => x.status === "waiting")) {
+      this.truckWaitsMs.push(this.now - t.arrivedAt);
+    }
   }
 
-  private resolveGhost(announce: boolean) {
-    const cb = this.curveballs.find((c) => c.kind === "ghost_pallet" && !c.resolved);
-    if (cb) cb.resolved = true;
-    if (announce && this.ghostSkuId) {
-      this.toast(
-        "replenisher",
-        `🚨 INVENTORY DISCREPANCY flagged by picker: ${skuById(this.ghostSkuId).name} pick face is actually EMPTY. Emergency transfer needed!`,
-        "alert"
-      );
+  // ----- role timers (Easy: only run while that role has a backlog) -----
+
+  private backlogs(): Record<RoleId, boolean> {
+    return {
+      receiver: this.inboundTrucks.some((t) => t.status !== "departed") || this.putawayTasks.length > 0,
+      replenisher:
+        this.approcheTasks.some((t) => t.status === "pending") ||
+        this.transferJobs.length > 0 ||
+        this.anomalies.some((a) => a.status === "visible" && a.role === "replenisher") ||
+        this.stock.some(
+          (s) =>
+            s.reserveUnits + s.onOrderUnits < s.reserveMin ||
+            (s.pickingUnits < s.pickMin && s.reserveUnits >= productById(s.productId).unitsPerPallet)
+        ),
+      picker:
+        this.anomalies.some((a) => a.status === "visible" && a.role === "picker") ||
+        this.orders.some((o) => ["queued", "transit", "picking", "control"].includes(o.status)),
+      dispatcher: this.orders.some((o) => ["staged", "loaded"].includes(o.status)),
+    };
+  }
+
+  private updateRoleTimers(dt: number) {
+    const backlog = this.backlogs();
+    for (const role of ROLES) {
+      const timer = this.roleTimers[role];
+      timer.running = this.mode.globalTimer ? true : backlog[role];
+      if (timer.running) timer.activeMs += dt;
     }
-    this.ghostSkuId = null;
-    this.ghostDiscovered = false;
   }
 
   // =========================================================================
-  // INTENT HANDLERS — one section per role
+  // RÉCEPTION — planification quai, contrôle livraison, mise en stock ABC
   // =========================================================================
-
-  // ----- Receiver -----
 
   assignDock(truckId: string, dockId: string) {
     const truck = this.inboundTrucks.find((t) => t.id === truckId);
     const dock = this.docks.find((d) => d.id === dockId);
-    if (!truck || truck.status !== "waiting") throw new Error("Truck not in the yard");
-    if (!dock || dock.truckId) throw new Error("Dock occupied");
+    if (!truck || truck.status !== "waiting") throw new Error("Camion non disponible sur le parc");
+    if (!dock || dock.truckId) throw new Error("Quai occupé");
     dock.truckId = truck.id;
     truck.dockId = dock.id;
     truck.status = "docked";
-    truck.pallets.forEach((p) => (p.status = "qc"));
     this.truckWaitsMs.push(this.now - truck.arrivedAt);
     this.trucksServed++;
   }
 
-  qcSwipe(palletId: string, accept: boolean, zone?: AbcZone) {
-    const truck = this.inboundTrucks.find((t) => t.pallets.some((p) => p.id === palletId));
-    const pallet = truck?.pallets.find((p) => p.id === palletId);
-    if (!truck || !pallet || pallet.status !== "qc") throw new Error("Pallet not at QC");
-    const damaged = this.damagedPallets.has(pallet.id);
+  controlLine(lineId: string, accept: boolean) {
+    const truck = this.inboundTrucks.find((t) => t.lines.some((l) => l.id === lineId));
+    const line = truck?.lines.find((l) => l.id === lineId);
+    if (!truck || !line || truck.status !== "docked") throw new Error("Ligne non disponible au contrôle");
+    if (line.decision !== "pending") throw new Error("Ligne déjà traitée");
 
-    if (accept) {
-      if (!zone) throw new Error("Pick a put-away zone");
-      pallet.status = "buffer";
-      this.inboundBuffer.push(pallet);
-      if (damaged) this.charge("damagedAccepted", "receiver", skuById(pallet.skuId).name);
-      if (zone !== skuById(pallet.skuId).zone) this.charge("wrongZone", "receiver", skuById(pallet.skuId).name);
-      this.toast("replenisher", `Pallet inbound: ${pallet.qty} × ${skuById(pallet.skuId).name}`, "info");
-    } else {
-      pallet.status = "rejected";
-      if (!damaged) this.charge("goodRejected", "receiver", skuById(pallet.skuId).name);
+    const damaged = this.damagedLines.has(line.id);
+    const conform =
+      !damaged && line.deliveredProductId === line.orderedProductId && line.deliveredQty === line.orderedQty;
+    line.decision = accept ? "accepted" : "declined";
+
+    if (accept && !conform) {
+      const what = damaged
+        ? "marchandise endommagée"
+        : line.deliveredProductId !== line.orderedProductId
+          ? `mauvais produit (${line.deliveredProductId} au lieu de ${line.orderedProductId})`
+          : `écart de quantité (${line.deliveredQty} au lieu de ${line.orderedQty})`;
+      this.fault(
+        "acceptedNonConform",
+        "receiver",
+        "Contrôle réception",
+        `Ligne acceptée : ${what}`,
+        `Le superviseur a substitué ${line.orderedQty} u. conformes de ${line.orderedProductId}`,
+        () => this.createPutaway(line.orderedProductId, line.orderedQty),
+        () => {
+          // Realistic: what was accepted is what enters the warehouse.
+          this.createPutaway(line.deliveredProductId, line.deliveredQty);
+          if (damaged) {
+            const cur = this.damagedReserve.get(line.deliveredProductId) ?? 0;
+            this.damagedReserve.set(line.deliveredProductId, cur + line.deliveredQty);
+          }
+        }
+      );
+    } else if (!accept && conform) {
+      this.fault(
+        "declinedConform",
+        "receiver",
+        "Contrôle réception",
+        `Ligne conforme refusée (${line.orderedQty} u. ${line.orderedProductId})`,
+        "Le superviseur a réintégré la marchandise refusée à tort",
+        () => this.createPutaway(line.orderedProductId, line.orderedQty),
+        () => {
+          // Realistic: the goods go back on the truck. Stock shortage ahead.
+        }
+      );
+    } else if (accept && conform) {
+      this.createPutaway(line.orderedProductId, line.orderedQty);
     }
+    // (decline non-conform = correct, nothing enters stock)
 
-    // Truck fully worked? Free the dock for the next one in the yard.
-    if (truck.pallets.every((p) => p.status !== "qc" && p.status !== "on_truck")) {
+    if (truck.lines.every((l) => l.decision !== "pending")) {
       truck.status = "departed";
       const dock = this.docks.find((d) => d.truckId === truck.id);
       if (dock) dock.truckId = null;
       this.inboundTrucks = this.inboundTrucks.filter((t) => t !== truck);
+      this.toast("receiver", `${truck.label} contrôlé — quai libéré`, "info");
     }
   }
 
-  // ----- Replenisher -----
+  private createPutaway(productId: string, qty: number) {
+    this.putawayTasks.push({ id: this.newId("put"), productId, qty, createdAt: this.now });
+  }
 
-  putaway(palletId: string, target: "reserve" | "pick") {
-    const idx = this.inboundBuffer.findIndex((p) => p.id === palletId);
-    if (idx < 0) throw new Error("Pallet not in buffer");
-    const pallet = this.inboundBuffer[idx];
-    this.inboundBuffer.splice(idx, 1);
-    pallet.status = "stored";
-    const s = this.stockOf(pallet.skuId);
-    if (target === "reserve") {
-      s.reserve += pallet.qty;
+  putaway(taskId: string, zone: AbcZone) {
+    const idx = this.putawayTasks.findIndex((t) => t.id === taskId);
+    if (idx < 0) throw new Error("Tâche de mise en stock inconnue");
+    const task = this.putawayTasks[idx];
+    this.putawayTasks.splice(idx, 1);
+    const product = productById(task.productId);
+    this.stockOf(task.productId).reserveUnits += task.qty;
+
+    if (zone !== product.zone) {
+      this.fault(
+        "wrongZone",
+        "receiver",
+        "Mise en stock",
+        `${task.productId} (rotation ${product.rotation}) rangé en zone ${zone}`,
+        `Le superviseur a déplacé la palette en zone ${product.zone}`,
+        () => {},
+        () => {
+          // Realistic: the next rempotage of this product will lose time
+          // searching for the pallet (and surface an anomaly).
+          this.misplacedReserve.add(task.productId);
+        }
+      );
+    }
+  }
+
+  // =========================================================================
+  // STOCK — réapprovisionnement, rempotage, approche
+  // =========================================================================
+
+  replenishOrder(productId: string, qty: number) {
+    const s = this.stockOf(productId);
+    if (!Number.isFinite(qty) || qty <= 0) throw new Error("Quantité invalide");
+    const current = s.reserveUnits + s.onOrderUnits;
+
+    if (current >= s.reserveMin) {
+      this.fault(
+        "reapproUseless",
+        "replenisher",
+        "Réapprovisionnement",
+        `Commande de ${qty} u. de ${productId} alors que le stock (${current}) couvre le seuil min (${s.reserveMin})`,
+        "Le superviseur a annulé la commande inutile",
+        () => {},
+        () => this.placeSupplierOrder(productId, qty)
+      );
+      return;
+    }
+
+    const correctQty = s.reserveMax - current;
+    if (qty !== correctQty) {
+      this.fault(
+        "reapproWrongQty",
+        "replenisher",
+        "Réapprovisionnement",
+        `Commande de ${qty} u. de ${productId} (attendu : ${correctQty} pour atteindre le max ${s.reserveMax})`,
+        `Le superviseur a rectifié la commande à ${correctQty} u.`,
+        () => this.placeSupplierOrder(productId, correctQty),
+        () => this.placeSupplierOrder(productId, qty)
+      );
+      return;
+    }
+    this.placeSupplierOrder(productId, qty);
+    this.toast("replenisher", `Commande fournisseur : ${qty} u. de ${productId} (livraison ~${Math.round(REAPPRO_LEAD_MS / 1000)} s)`, "info");
+  }
+
+  private placeSupplierOrder(productId: string, qty: number) {
+    this.stockOf(productId).onOrderUnits += qty;
+    const line: DeliveryLineSpec = {
+      productId,
+      orderedQty: qty,
+      deliveredProductId: productId,
+      deliveredQty: qty,
+      damaged: false,
+      conditionNote: "RAS",
+    };
+    if (!this.pendingReappro) this.pendingReappro = { lines: [], firstAt: this.now };
+    this.pendingReappro.lines.push(line);
+  }
+
+  rempotage(palletProductId: string, slotProductId: string) {
+    const reserve = this.stockOf(palletProductId);
+    const slot = this.stockOf(slotProductId);
+    const pallet = productById(palletProductId);
+    if (reserve.reserveUnits < pallet.unitsPerPallet) throw new Error("Pas de palette complète en réserve");
+    if (this.transferJobs.some((j) => j.productId === slotProductId)) throw new Error("Rempotage déjà en cours vers cet emplacement");
+
+    // Misplaced pallet (realistic cascade from a wrong-zone put-away):
+    // the transfer takes twice as long and surfaces an anomaly.
+    let duration = TRANSFER_MS;
+    if (this.misplacedReserve.has(palletProductId)) {
+      this.misplacedReserve.delete(palletProductId);
+      duration *= 2;
+      this.addAnomaly(
+        "misplaced_pallet",
+        "replenisher",
+        `Palette ${palletProductId} introuvable en zone ${pallet.zone} — rangée au mauvais endroit, recherche en cours (+${TRANSFER_MS / 1000} s)`,
+        palletProductId
+      ).status = "resolved"; // informative: resolved by the search itself
+    }
+
+    if (palletProductId !== slotProductId) {
+      this.fault(
+        "wrongSlot",
+        "replenisher",
+        "Rempotage",
+        `Palette ${palletProductId} envoyée vers l'emplacement picking ${slotProductId}`,
+        `Le superviseur a redirigé la palette vers l'emplacement ${palletProductId}`,
+        () => this.startTransfer(palletProductId, palletProductId, duration),
+        () => {
+          // Realistic: the slot now physically contains the wrong product.
+          // The system count goes up; the Picker will discover the truth.
+          this.slotPhysical.set(slotProductId, palletProductId);
+          this.startTransfer(palletProductId, slotProductId, duration);
+        }
+      );
+      return;
+    }
+
+    if (slot.pickingUnits + pallet.unitsPerPallet > slot.pickMax) {
+      this.fault(
+        "slotOverflow",
+        "replenisher",
+        "Rempotage",
+        `Rempotage de ${pallet.unitsPerPallet} u. alors que le picking ${slotProductId} dépasserait le max (${slot.pickMax})`,
+        "Le superviseur a bloqué le rempotage excédentaire",
+        () => {},
+        () => this.startTransfer(palletProductId, slotProductId, duration)
+      );
+      return;
+    }
+
+    this.startTransfer(palletProductId, slotProductId, duration);
+  }
+
+  private startTransfer(palletProductId: string, slotProductId: string, duration: number) {
+    const pallet = productById(palletProductId);
+    this.stockOf(palletProductId).reserveUnits -= pallet.unitsPerPallet;
+    // Damaged units flow with the pallet (realistic only — the map is empty otherwise).
+    const dmg = Math.min(pallet.unitsPerPallet, this.damagedReserve.get(palletProductId) ?? 0);
+    if (dmg > 0) {
+      this.damagedReserve.set(palletProductId, (this.damagedReserve.get(palletProductId) ?? 0) - dmg);
+      this.damagedPicking.set(slotProductId, (this.damagedPicking.get(slotProductId) ?? 0) + dmg);
+    }
+    this.transferJobs.push({
+      productId: slotProductId,
+      units: pallet.unitsPerPallet,
+      finishAt: this.now + duration,
+    });
+  }
+
+  approcheSend(taskId: string) {
+    const task = this.approcheTasks.find((t) => t.id === taskId);
+    if (!task || task.status !== "pending") throw new Error("Demande d'approche inconnue");
+    const product = productById(task.productId);
+    const s = this.stockOf(task.productId);
+    const units = product.unitsPerPallet * task.pallets;
+    if (s.reserveUnits < units) throw new Error(`Réserve insuffisante (${s.reserveUnits}/${units} u.)`);
+    s.reserveUnits -= units;
+    task.status = "done";
+    const order = this.orders.find((o) => o.id === task.orderId);
+    this.schedule(APPROCHE_MS, () => {
+      if (order?.fullPallet) order.fullPallet.fulfilled = true;
+      this.toast("dispatcher", `Approche à quai : ${task.pallets} palette(s) ${task.productId} pour ${task.orderLabel}`, "info");
+    });
+  }
+
+  resolveAnomaly(anomalyId: string) {
+    const a = this.anomalies.find((x) => x.id === anomalyId && x.status === "visible");
+    if (!a) throw new Error("Anomalie inconnue ou déjà traitée");
+    if (a.kind === "slot_mismatch" && a.productId) {
+      // Swap the foreign pallet back: slot emptied, units return to reserve.
+      const slot = this.stockOf(a.productId);
+      const physical = this.slotPhysical.get(a.productId);
+      if (physical) {
+        const units = Math.min(slot.pickingUnits, productById(physical).unitsPerPallet);
+        slot.pickingUnits -= units;
+        this.stockOf(physical).reserveUnits += units;
+        this.slotPhysical.delete(a.productId);
+        this.slotRevealed.delete(a.productId);
+        this.toast("picker", `Emplacement ${a.productId} corrigé — palette ${physical} retournée en réserve`, "info");
+      }
+    }
+    a.status = "resolved";
+  }
+
+  // =========================================================================
+  // PICKING — plan de prélèvement, picking, contrôle
+  // =========================================================================
+
+  planRoute(orderId: string, sequence: string[]) {
+    const order = this.orderOf(orderId);
+    if (order.status !== "queued") throw new Error("Commande déjà planifiée");
+    const expected = order.lines.map((l) => l.productId).sort();
+    if ([...sequence].sort().join() !== expected.join()) throw new Error("Le plan doit couvrir chaque produit de la commande, une fois");
+
+    const cells = sequence.map((pid) => productById(pid).cell);
+    const dist = tourDistance(cells);
+    const optimal = optimalTour(order.lines.map((l) => productById(l.productId).cell));
+    order.planDistance = dist;
+    order.optimalDistance = optimal;
+
+    let usedDist = dist;
+    if (dist > optimal) {
+      this.fault(
+        "suboptimalRoute",
+        "picker",
+        "Plan de prélèvement",
+        `Plan de ${dist} cases (optimal : ${optimal})`,
+        "Le superviseur a réordonné la tournée au plus court",
+        () => {
+          usedDist = optimal;
+        },
+        () => {
+          // Realistic: you walk the route you planned.
+        }
+      );
+    }
+    order.status = "transit";
+    order.transitUntil = this.now + usedDist * MS_PER_CELL;
+  }
+
+  pickAssign(orderId: string, slotProductId: string, qty: number) {
+    const order = this.orderOf(orderId);
+    if (order.status !== "picking") throw new Error("Commande non disponible au picking");
+    if (!Number.isFinite(qty) || qty <= 0) throw new Error("Quantité invalide");
+    const slot = this.stockOf(slotProductId);
+
+    // Realistic cascade: the slot physically contains another product.
+    const physical = this.slotPhysical.get(slotProductId);
+    if (physical && !this.slotRevealed.has(slotProductId)) {
+      this.slotRevealed.add(slotProductId);
+      this.addAnomaly(
+        "slot_mismatch",
+        "replenisher",
+        `Emplacement picking ${slotProductId} : le système annonce ${slotProductId} mais la palette contient ${physical}. Signalé au stock pour échange.`,
+        slotProductId,
+        order.id
+      );
+      throw new Error(`Anomalie : l'emplacement ${slotProductId} contient ${physical} — signalé au stock`);
+    }
+
+    if (slot.pickingUnits < qty) {
+      // Stock-out.
+      if (this.mode.supervisor) {
+        const p = productById(slotProductId);
+        if (slot.reserveUnits >= p.unitsPerPallet) {
+          this.fault(
+            "pickingStarved",
+            "replenisher",
+            "Rempotage",
+            `Rupture picking sur ${slotProductId} au moment du prélèvement`,
+            "Le superviseur a rempoté une palette en urgence",
+            () => {
+              slot.reserveUnits -= p.unitsPerPallet;
+              slot.pickingUnits += p.unitsPerPallet;
+            },
+            () => {}
+          );
+        }
+      }
+      if (slot.pickingUnits < qty) {
+        if (!this.mode.supervisor && !this.anomalies.some((a) => a.kind === "stockout" && a.productId === slotProductId && a.orderId === order.id && a.status === "visible")) {
+          this.addAnomaly(
+            "stockout",
+            "picker",
+            `Rupture picking : ${slotProductId} (${slot.pickingUnits} u. restantes pour ${qty} demandées) — réappro d'urgence, partiel ou report ?`,
+            slotProductId,
+            order.id
+          );
+        }
+        throw new Error(`Stock picking insuffisant : ${slot.pickingUnits} u. de ${slotProductId}`);
+      }
+    }
+
+    const line = order.lines.find((l) => l.productId === slotProductId);
+    if (!line) {
+      this.fault(
+        "wrongProductPicked",
+        "picker",
+        "Picking",
+        `${qty} u. de ${slotProductId} affectées à ${order.label} qui ne le demande pas`,
+        "Le superviseur a remis le produit en stock",
+        () => {},
+        () => {
+          slot.pickingUnits -= qty;
+          order.defects.push(`${qty} u. de ${slotProductId} non commandées dans la palette`);
+        }
+      );
+      return;
+    }
+
+    slot.pickingUnits -= qty;
+    line.preparedQty += qty;
+    if (physical) line.preparedProductId = physical;
+    const dmgAvail = this.damagedPicking.get(slotProductId) ?? 0;
+    const dmg = Math.min(qty, dmgAvail);
+    if (dmg > 0) {
+      this.damagedPicking.set(slotProductId, dmgAvail - dmg);
+      line.damagedUnits += dmg;
+    }
+  }
+
+  stockoutAction(orderId: string, productId: string, action: "emergency" | "partial" | "postpone") {
+    const order = this.orderOf(orderId);
+    const anomaly = this.anomalies.find(
+      (a) => a.kind === "stockout" && a.orderId === orderId && a.productId === productId && a.status === "visible"
+    );
+    if (!anomaly) throw new Error("Pas de rupture signalée sur cette ligne");
+    anomaly.status = "resolved";
+
+    if (action === "emergency") {
+      const p = productById(productId);
+      const s = this.stockOf(productId);
+      if (s.reserveUnits < p.unitsPerPallet) throw new Error("Réserve vide — réappro d'urgence impossible");
+      this.startTransfer(productId, productId, TRANSFER_MS);
+      this.toast("replenisher", `🚨 Réappro d'URGENCE demandé par le picking : ${productId}`, "alert");
+      this.toast("picker", `Réappro d'urgence lancé (${TRANSFER_MS / 1000} s)`, "info");
+    } else if (action === "partial") {
+      const line = order.lines.find((l) => l.productId === productId);
+      if (line) line.short = true;
+      this.toast("picker", `${order.label} : ligne ${productId} validée en partiel`, "warn");
     } else {
-      // Cross-dock straight to the pick face, capped by location max.
-      if (this.ghostSkuId === pallet.skuId && !this.ghostDiscovered) {
-        s.pick = 0; // restore physical truth before adding real units
-        this.resolveGhost(false);
-      }
-      const space = Math.max(0, s.max - s.pick);
-      const moved = Math.min(pallet.qty, space);
-      s.pick += moved;
-      const leftover = pallet.qty - moved;
-      if (leftover > 0) {
-        s.reserve += leftover;
-        this.toast("replenisher", `Pick face full — ${leftover} units overflowed to reserve`, "warn");
-      }
+      order.status = "queued";
+      order.transitUntil = null;
+      this.toast("picker", `${order.label} reportée en fin de file`, "warn");
     }
   }
 
-  transfer(skuId: string) {
-    const s = this.stockOf(skuId);
-    if (this.transferJobs.some((j) => j.skuId === skuId)) throw new Error("Transfer already running");
-    const qty = Math.min(s.reserve, Math.max(0, s.max - s.pick));
-    if (s.reserve <= 0) throw new Error("No reserve stock");
-    if (qty <= 0) throw new Error("Pick face already at max");
-    s.reserve -= qty;
-    this.transferJobs.push({ skuId, qty, startedAt: this.now, finishAt: this.now + TRANSFER_MS });
-  }
+  pickControl(orderId: string, conformMarks: Record<string, boolean>) {
+    const order = this.orderOf(orderId);
+    if (order.status !== "picking") throw new Error("Commande non disponible au contrôle");
 
-  // ----- Picker -----
-
-  startRoute(orderId: string, path: Cell[]) {
-    if (this.activeRoute) throw new Error("Already driving a route");
-    const order = this.orders.find((o) => o.id === orderId);
-    if (!order || order.status !== "queued") throw new Error("Order not in queue");
-    this.validateRoute(order, path);
-    order.status = "picking";
-    const lines = order.lines.filter((l) => l.picked < l.qty).length;
-    const duration = path.length * MS_PER_CELL + lines * PICK_MS_PER_LINE;
-    this.activeRoute = { orderId, path, startedAt: this.now, finishAt: this.now + duration };
-  }
-
-  private validateRoute(order: Order, path: Cell[]) {
-    if (path.length < 2) throw new Error("Draw a route first");
-    if (!cellEq(path[0], DEPOT)) throw new Error("Route must start at the depot");
-    if (!cellEq(path[path.length - 1], STAGING)) throw new Error("Route must end at staging");
-    const blocked = new Set(this.blockedCells.map(cellKey));
-    for (let i = 0; i < path.length; i++) {
-      const c = path[i];
-      if (!isWalkable(c.x, c.y)) throw new Error("Route leaves the corridors");
-      if (blocked.has(cellKey(c))) throw new Error("Route crosses a blocked aisle");
-      if (i > 0 && Math.abs(c.x - path[i - 1].x) + Math.abs(c.y - path[i - 1].y) !== 1)
-        throw new Error("Route has gaps");
-    }
-    const visited = new Set(path.map(cellKey));
+    let anyReset = false;
     for (const line of order.lines) {
-      if (line.picked >= line.qty) continue;
-      if (!visited.has(cellKey(skuById(line.skuId).cell)))
-        throw new Error(`Route misses ${skuById(line.skuId).name}`);
+      const marked = conformMarks[line.productId];
+      if (marked === undefined) throw new Error("Chaque ligne doit être contrôlée");
+      const trulyConform =
+        line.short ||
+        (line.preparedQty === line.qty &&
+          line.damagedUnits === 0 &&
+          (line.preparedProductId === null || line.preparedProductId === line.productId));
+
+      if (marked && !trulyConform) {
+        const what =
+          line.preparedProductId && line.preparedProductId !== line.productId
+            ? `mauvais produit (${line.preparedProductId})`
+            : line.damagedUnits > 0
+              ? `${line.damagedUnits} u. endommagées`
+              : `quantité ${line.preparedQty}/${line.qty}`;
+        this.fault(
+          "controlMissed",
+          "picker",
+          "Contrôle picking",
+          `Ligne ${line.productId} validée conforme : ${what}`,
+          "Le superviseur a corrigé la ligne avant expédition",
+          () => {
+            line.preparedQty = line.qty;
+            line.damagedUnits = 0;
+            line.preparedProductId = null;
+          },
+          () => {
+            order.defects.push(`Ligne ${line.productId} : ${what}`);
+          }
+        );
+      } else if (!marked && trulyConform) {
+        this.charge("controlFalseAlarm", "picker", line.productId);
+        this.resetLine(line);
+        anyReset = true;
+      } else if (!marked && !trulyConform) {
+        // Correct catch: the line goes back to picking, damage discarded.
+        this.resetLine(line);
+        anyReset = true;
+      }
     }
-  }
 
-  flagGhost(skuId: string) {
-    if (this.ghostSkuId !== skuId || !this.ghostDiscovered) throw new Error("No discrepancy to flag here");
-    const s = this.stockOf(skuId);
-    s.pick = 0; // WMS corrected to physical truth
-    this.resolveGhost(true);
-    for (const o of this.orders) if (o.status === "queued") o.stockoutFlag = false;
-    this.toast("picker", "Discrepancy flagged — replenisher alerted ✅", "info");
-  }
-
-  // ----- Dispatcher -----
-
-  loadOrder(orderId: string, truckId: string) {
-    const order = this.orders.find((o) => o.id === orderId);
-    const truck = this.outboundTrucks.find((t) => t.id === truckId);
-    if (!order || order.status !== "staged") throw new Error("Order not staged");
-    if (!truck || truck.status !== "loading") throw new Error("Truck not loading");
-    const loaded = truck.loadedOrderIds
-      .map((id) => this.orders.find((o) => o.id === id)!)
-      .filter(Boolean);
-    const w = loaded.reduce((a, o) => a + o.weight, 0) + order.weight;
-    const v = loaded.reduce((a, o) => a + o.volume, 0) + order.volume;
-    if (w > truck.maxWeight) throw new Error(`Too heavy: ${w}kg > ${truck.maxWeight}kg max`);
-    if (v > truck.maxVolume) throw new Error(`No volume left: ${v.toFixed(1)}m³ > ${truck.maxVolume}m³`);
-    order.status = "loaded";
-    order.assignedTruckId = truck.id;
-    truck.loadedOrderIds.push(order.id);
-  }
-
-  unloadOrder(orderId: string) {
-    const order = this.orders.find((o) => o.id === orderId);
-    if (!order || order.status !== "loaded" || !order.assignedTruckId) throw new Error("Order not loaded");
-    const truck = this.outboundTrucks.find((t) => t.id === order.assignedTruckId);
-    if (!truck || truck.status !== "loading") throw new Error("Truck already gone");
-    truck.loadedOrderIds = truck.loadedOrderIds.filter((id) => id !== orderId);
+    if (anyReset) {
+      order.status = "picking";
+      this.toast("picker", `${order.label} : ligne(s) non conformes à re-préparer`, "warn");
+      return;
+    }
     order.status = "staged";
-    order.assignedTruckId = null;
+    if (this.stagingIncidents.delete(order.id)) {
+      order.defects.push("Film de palettisation déchiré au transfert vers le quai");
+    }
+    this.toast("dispatcher", `${order.label} (${order.client}) à quai — ${order.destination}, ${order.weight} kg${order.priority === "haute" ? ", PRIORITÉ HAUTE" : ""}`, "info");
+  }
+
+  private resetLine(line: OrderLine) {
+    const clean = Math.max(0, line.preparedQty - line.damagedUnits);
+    if (line.preparedProductId && line.preparedProductId !== line.productId) {
+      this.stockOf(line.preparedProductId).reserveUnits += line.preparedQty;
+    } else {
+      this.stockOf(line.productId).pickingUnits += clean;
+    }
+    line.preparedQty = 0;
+    line.damagedUnits = 0;
+    line.preparedProductId = null;
+    line.short = false;
+  }
+
+  // =========================================================================
+  // EXPÉDITION — planification camions, contrôle palettes, chargement
+  // =========================================================================
+
+  assignTruck(orderId: string, truckId: string) {
+    const order = this.orderOf(orderId);
+    const truck = this.outboundTrucks.find((t) => t.id === truckId);
+    if (order.status !== "staged" || order.truckId) throw new Error("Commande non disponible à la planification");
+    if (!truck || truck.status !== "loading" || truck.loadingClosed) throw new Error("Camion indisponible");
+    if (order.fullPallet && !order.fullPallet.fulfilled) throw new Error("Palette d'approche pas encore à quai");
+
+    const assignedWeight = truck.assignedOrderIds
+      .map((id) => this.orders.find((o) => o.id === id)!)
+      .reduce((a, o) => a + o.weight, 0);
+    if (assignedWeight + order.weight > truck.maxWeight) {
+      throw new Error(`Capacité dépassée : ${assignedWeight + order.weight} kg > ${truck.maxWeight} kg`);
+    }
+
+    if (order.destination !== truck.destination) {
+      this.fault(
+        "wrongDestination",
+        "dispatcher",
+        "Planification expédition",
+        `${order.label} (${order.destination}) affectée au camion ${truck.label} (${truck.destination})`,
+        "Le superviseur a refusé l'affectation",
+        () => {},
+        () => {
+          order.truckId = truck.id;
+          truck.assignedOrderIds.push(order.id);
+        }
+      );
+      return;
+    }
+
+    order.truckId = truck.id;
+    truck.assignedOrderIds.push(order.id);
+  }
+
+  unassignTruck(orderId: string) {
+    const order = this.orderOf(orderId);
+    if (!order.truckId || order.status !== "staged") throw new Error("Commande non affectée");
+    const truck = this.outboundTrucks.find((t) => t.id === order.truckId);
+    if (!truck || truck.loadingClosed || truck.loadedOrderIds.includes(order.id)) throw new Error("Trop tard pour désaffecter");
+    truck.assignedOrderIds = truck.assignedOrderIds.filter((id) => id !== order.id);
+    order.truckId = null;
+    order.expeditionChecked = false;
+  }
+
+  palletCheck(orderId: string, approve: boolean) {
+    const order = this.orderOf(orderId);
+    if (order.status !== "staged" || !order.truckId) throw new Error("Commande non affectée à un camion");
+    if (order.expeditionChecked) throw new Error("Palette déjà contrôlée");
+    const trulyGood = order.defects.length === 0;
+
+    if (approve && !trulyGood) {
+      this.fault(
+        "expeditionCheckMissed",
+        "dispatcher",
+        "Contrôle palettes",
+        `${order.label} approuvée malgré : ${order.defects.join(" ; ")}`,
+        "Le superviseur a fait re-préparer la palette",
+        () => {
+          order.defects = [];
+          order.expeditionChecked = true;
+        },
+        () => {
+          order.expeditionChecked = true; // ships with its defects
+        }
+      );
+      return;
+    }
+    if (!approve && trulyGood) {
+      this.charge("expeditionFalseAlarm", "dispatcher", order.label);
+      this.reprepJobs.push({ orderId: order.id, finishAt: this.now + REPREP_MS });
+      this.toast("dispatcher", `${order.label} renvoyée en re-préparation (${REPREP_MS / 1000} s)`, "warn");
+      return;
+    }
+    if (!approve && !trulyGood) {
+      // Correct catch: re-preparation fixes the defects.
+      this.reprepJobs.push({ orderId: order.id, finishAt: this.now + REPREP_MS });
+      this.toast("dispatcher", `${order.label} refusée à juste titre — re-préparation (${REPREP_MS / 1000} s)`, "info");
+      return;
+    }
+    order.expeditionChecked = true;
+  }
+
+  loadItem(truckId: string, orderId: string) {
+    const truck = this.outboundTrucks.find((t) => t.id === truckId);
+    const order = this.orderOf(orderId);
+    if (!truck || truck.status !== "loading" || truck.loadingClosed) throw new Error("Camion indisponible au chargement");
+    if (order.truckId !== truck.id || order.status !== "staged") throw new Error("Commande non affectée à ce camion");
+    if (!order.expeditionChecked) throw new Error("Palette non contrôlée — contrôle obligatoire avant chargement");
+    truck.loadedOrderIds.push(order.id);
+    order.status = "loaded";
+  }
+
+  closeLoading(truckId: string) {
+    const truck = this.outboundTrucks.find((t) => t.id === truckId);
+    if (!truck || truck.status !== "loading" || truck.loadingClosed) throw new Error("Camion indisponible");
+    if (truck.loadedOrderIds.length === 0) throw new Error("Aucun colis chargé");
+
+    // Loading order rule: what is loaded later sits ON TOP. A fragile parcel
+    // followed by a heavier one means it gets crushed.
+    const loaded = truck.loadedOrderIds.map((id) => this.orders.find((o) => o.id === id)!);
+    let violations = 0;
+    for (let i = 0; i < loaded.length; i++) {
+      if (!this.orderFragile(loaded[i])) continue;
+      for (let j = i + 1; j < loaded.length; j++) {
+        if (!this.orderFragile(loaded[j]) && loaded[j].weight > loaded[i].weight) violations++;
+      }
+    }
+    for (let v = 0; v < Math.min(violations, 3); v++) {
+      this.fault(
+        "crushedLoad",
+        "dispatcher",
+        "Chargement",
+        "Colis fragile chargé avant un colis plus lourd",
+        "Le superviseur a réordonné le chargement",
+        () => {},
+        () => {
+          const fragile = loaded.find((o) => this.orderFragile(o));
+          if (fragile && !fragile.defects.includes("Colis écrasé au chargement")) {
+            fragile.defects.push("Colis écrasé au chargement");
+          }
+        }
+      );
+    }
+    truck.loadingClosed = true;
   }
 
   dispatchTruck(truckId: string) {
     const truck = this.outboundTrucks.find((t) => t.id === truckId);
-    if (!truck || truck.status !== "loading") throw new Error("Truck not loading");
+    if (!truck || truck.status !== "loading") throw new Error("Camion indisponible");
+    // An empty truck can be sent away to free the bay for another destination.
+    const empty = truck.assignedOrderIds.length === 0 && truck.loadedOrderIds.length === 0;
+    if (!truck.loadingClosed && !empty) throw new Error("Clôturez d'abord le chargement");
     this.departTruck(truck, false);
   }
 
-  alertPicker(orderId: string) {
-    const order = this.orders.find((o) => o.id === orderId);
-    if (!order) throw new Error("Unknown order");
-    const secs = Math.max(0, Math.round((order.deadline - this.now) / 1000));
-    this.toast("picker", `🚨 DISPATCH: jump ${order.label} (${order.clientName}) to the FRONT — ${secs}s to deadline!`, "alert");
-  }
-
   // =========================================================================
-  // TELEMETRY — feeds the post-game Team Heatmap
+  // TELEMETRY
   // =========================================================================
 
   private sampleTelemetry() {
     const waiting = this.inboundTrucks.filter((t) => t.status === "waiting").length;
-    const qcPallets = this.inboundTrucks
+    const pendingLines = this.inboundTrucks
       .filter((t) => t.status === "docked")
-      .reduce((a, t) => a + t.pallets.filter((p) => p.status === "qc").length, 0);
-    const belowMin = this.stock.filter((s) => s.pick < s.min).length;
-    const queued = this.orders.filter((o) => o.status === "queued");
-    const overdueQueued = queued.filter((o) => this.now > o.deadline).length;
-    const staged = this.orders.filter((o) => o.status === "staged");
-    const overdueStaged = staged.filter((o) => this.now > o.deadline).length;
+      .reduce((a, t) => a + t.lines.filter((l) => l.decision === "pending").length, 0);
+    const reapproNeeded = this.stock.filter((s) => s.reserveUnits + s.onOrderUnits < s.reserveMin).length;
+    const belowPickMin = this.stock.filter((s) => s.pickingUnits < s.pickMin).length;
+    const approchePending = this.approcheTasks.filter((t) => t.status === "pending").length;
+    const pickingWork = this.orders.filter((o) => ["queued", "transit", "picking", "control"].includes(o.status)).length;
+    const expeditionWork = this.orders.filter((o) => ["staged", "loaded"].includes(o.status)).length;
 
     const pressures: Record<Stage, number> = {
-      receiving: Math.min(1, waiting * 0.45 + qcPallets * 0.1),
-      replenishment: Math.min(1, belowMin * 0.3 + this.inboundBuffer.length * 0.1),
-      picking: Math.min(1, queued.length * 0.22 + overdueQueued * 0.2),
-      dispatch: Math.min(1, staged.length * 0.3 + overdueStaged * 0.2),
+      reception: Math.min(1, waiting * 0.4 + pendingLines * 0.06 + this.putawayTasks.length * 0.12),
+      stock: Math.min(1, reapproNeeded * 0.18 + belowPickMin * 0.2 + approchePending * 0.2),
+      picking: Math.min(1, pickingWork * 0.2),
+      expedition: Math.min(1, expeditionWork * 0.22),
     };
 
     const key = Math.floor(this.now / HEATMAP_BUCKET_MS);
     let acc = this.buckets.get(key);
     if (!acc) {
-      acc = { sums: { receiving: 0, replenishment: 0, picking: 0, dispatch: 0 }, count: 0 };
+      acc = { sums: { reception: 0, stock: 0, picking: 0, expedition: 0 }, count: 0 };
       this.buckets.set(key, acc);
     }
-    for (const stage of Object.keys(pressures) as Stage[]) acc.sums[stage] += pressures[stage];
+    for (const s of Object.keys(pressures) as Stage[]) acc.sums[s] += pressures[s];
     acc.count++;
   }
 
   // =========================================================================
-  // SERIALIZATION — what goes on the wire (private truth stripped)
+  // SERIALIZATION — private truth stripped
   // =========================================================================
 
   serialize(): TeamState {
     return {
       teamId: this.teamId,
       teamName: this.teamName,
-      clock: { now: this.now, durationMs: GAME_DURATION_MS },
+      difficulty: this.difficulty,
+      clock: { now: this.now, durationMs: this.mode.durationMs },
+      roleTimers: this.roleTimers,
       cost: this.cost,
       shippedCount: this.orders.filter((o) => o.status === "shipped").length,
       orderCount: this.orders.length,
+      supervisorCount: this.supervisorEvents.length,
       docks: this.docks,
       inboundTrucks: this.inboundTrucks,
-      inboundBuffer: this.inboundBuffer,
+      putawayTasks: this.putawayTasks,
       stock: this.stock,
+      transferJobs: this.transferJobs,
+      approcheTasks: this.approcheTasks,
       orders: this.orders,
       outboundTrucks: this.outboundTrucks,
-      blockedCells: this.blockedCells,
-      activeRoute: this.activeRoute,
-      transferJobs: this.transferJobs,
-      // Undiscovered ghost pallets stay invisible — discovery is the lesson.
-      curveballs: this.curveballs.filter((c) => c.targets.length > 0),
+      anomalies: this.anomalies.filter((a) => a.status === "visible"),
       players: this.players,
     };
   }

@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { io, Socket } from "socket.io-client";
 import type {
-  Curveball,
+  Difficulty,
   GameOverPayload,
   Intent,
   JoinPayload,
@@ -38,12 +38,10 @@ export interface GameClient {
   state: TeamState | null;
   reports: TeamReport[] | null;
   toasts: Toast[];
-  curveball: Curveball | null;
   joinError: string | null;
   join: (seat: Seat) => void;
-  startGame: () => void;
+  startGame: (difficulty: Difficulty) => void;
   send: (intent: Intent) => void;
-  dismissCurveball: () => void;
   /** server-synchronized game clock (game-relative ms), smooth between snapshots */
   gameNow: () => number;
 }
@@ -58,9 +56,7 @@ export function useGame(): GameClient {
   const [state, setState] = useState<TeamState | null>(null);
   const [reports, setReports] = useState<TeamReport[] | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
-  const [curveball, setCurveball] = useState<Curveball | null>(null);
   const [joinError, setJoinError] = useState<string | null>(null);
-  // wall-clock offset so countdowns animate smoothly between 4 Hz snapshots
   const clockOffset = useRef(0);
 
   useEffect(() => {
@@ -81,17 +77,12 @@ export function useGame(): GameClient {
     socket.on("toast", (t: ToastMsg) => {
       const toast: Toast = { ...t, id: ++toastId };
       setToasts((prev) => [...prev.slice(-3), toast]);
-      const ttl = t.severity === "alert" ? 6000 : 3500;
+      const ttl = t.severity === "alert" ? 7000 : 4000;
       setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== toast.id)), ttl);
-    });
-
-    socket.on("curveball", (cb: Curveball) => {
-      setCurveball(cb);
     });
 
     socket.on("game_over", (payload: GameOverPayload) => {
       setReports(payload.reports);
-      setCurveball(null);
       setPhase("over");
     });
 
@@ -108,25 +99,20 @@ export function useGame(): GameClient {
         setSeat(s);
         setPhase("lobby");
       } else {
-        setJoinError(res.error ?? "Could not join");
+        setJoinError(res.error ?? "Connexion impossible");
       }
     });
   }, []);
 
-  const startGame = useCallback(() => {
-    socketRef.current?.emit("start_game");
+  const startGame = useCallback((difficulty: Difficulty) => {
+    socketRef.current?.emit("start_game", { difficulty });
   }, []);
 
   const send = useCallback((intent: Intent) => {
     socketRef.current?.emit("intent", intent);
   }, []);
 
-  const dismissCurveball = useCallback(() => setCurveball(null), []);
-
   const gameNow = useCallback(() => Date.now() - clockOffset.current, []);
 
-  return {
-    phase, seat, lobby, state, reports, toasts, curveball, joinError,
-    join, startGame, send, dismissCurveball, gameNow,
-  };
+  return { phase, seat, lobby, state, reports, toasts, joinError, join, startGame, send, gameNow };
 }

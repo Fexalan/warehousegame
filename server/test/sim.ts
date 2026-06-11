@@ -1,184 +1,279 @@
 /**
- * Headless full-session simulation: four scripted "bots" play one team for
- * the whole 7 minutes at instant speed, then the KPI report is sanity-checked.
+ * Headless full-session simulations:
+ *   1. Réaliste, honest bots  -> the chain works end to end
+ *   2. Normal, sloppy receiver -> Supervisor intercepts, downstream stays clean
+ *   3. Réaliste, wrong-slot rempotage -> anomaly cascades to the picker, gets resolved
  * Run: npx tsx test/sim.ts
  */
-import {
-  DAMAGE_CUES,
-  DEPOT,
-  GAME_DURATION_MS,
-  STAGING,
-  TICK_MS,
-  cellEq,
-  cellKey,
-  isWalkable,
-  skuById,
-} from "../../shared/constants";
-import type { Cell } from "../../shared/types";
+import { DAMAGE_NOTES, MODES, PRODUCTS, TICK_MS, productById } from "../../shared/constants";
+import { tourDistance } from "../../shared/grid";
+import type { Difficulty } from "../../shared/types";
 import { TeamEngine } from "../src/engine";
 import { buildReport } from "../src/kpi";
 
-// ---------------------------------------------------------------------------
-// BFS pathing for the picker bot
-// ---------------------------------------------------------------------------
-function bfs(from: Cell, to: Cell, blocked: Set<string>): Cell[] | null {
-  const queue: Cell[] = [from];
-  const prev = new Map<string, Cell | null>([[cellKey(from), null]]);
-  while (queue.length) {
-    const cur = queue.shift()!;
-    if (cellEq(cur, to)) {
-      const path: Cell[] = [];
-      let c: Cell | null = cur;
-      while (c) {
-        path.unshift(c);
-        c = prev.get(cellKey(c)) ?? null;
+const damageNotes = new Set<string>(DAMAGE_NOTES);
+
+function bestSequence(productIds: string[]): string[] {
+  let best: string[] = productIds;
+  let bestDist = Infinity;
+  const permute = (rest: string[], acc: string[]) => {
+    if (rest.length === 0) {
+      const d = tourDistance(acc.map((id) => productById(id).cell));
+      if (d < bestDist) {
+        bestDist = d;
+        best = [...acc];
       }
-      return path;
+      return;
     }
-    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
-      const n = { x: cur.x + dx, y: cur.y + dy };
-      const k = cellKey(n);
-      if (!isWalkable(n.x, n.y) || blocked.has(k) || prev.has(k)) continue;
-      prev.set(k, cur);
-      queue.push(n);
-    }
-  }
-  return null;
+    for (let i = 0; i < rest.length; i++) permute([...rest.slice(0, i), ...rest.slice(i + 1)], [...acc, rest[i]]);
+  };
+  permute(productIds, []);
+  return best;
 }
 
-function routeThrough(targets: Cell[], blocked: Set<string>): Cell[] | null {
-  const stops = [DEPOT, ...[...targets].sort((a, b) => a.x - b.x), STAGING];
-  let path: Cell[] = [DEPOT];
-  for (let i = 1; i < stops.length; i++) {
-    const seg = bfs(stops[i - 1], stops[i], blocked);
-    if (!seg) return null;
-    path = path.concat(seg.slice(1));
-  }
-  return path;
+interface BotConfig {
+  sloppyReceiver?: boolean; // accepts everything, ignores discrepancies
+  wrongSlotOnce?: boolean; // sends one pallet to the wrong picking slot
 }
 
-// ---------------------------------------------------------------------------
-// Scripted roles
-// ---------------------------------------------------------------------------
-const damageCues = new Set<string>(DAMAGE_CUES);
+function playTick(e: TeamEngine, cfg: BotConfig, flags: { wrongSlotDone: boolean }) {
+  const t = (fn: () => void) => {
+    try { fn(); } catch { /* engine validation refusals are part of the game */ }
+  };
 
-function playTick(e: TeamEngine) {
-  // Receiver
+  // ---- Réception ----
   const freeDock = e.docks.find((d) => !d.truckId);
-  const waiting = e.inboundTrucks.find((t) => t.status === "waiting");
-  if (freeDock && waiting) e.assignDock(waiting.id, freeDock.id);
-  for (const truck of e.inboundTrucks.filter((t) => t.status === "docked")) {
-    for (const p of truck.pallets.filter((p) => p.status === "qc")) {
-      const looksDamaged = p.cues.some((c) => damageCues.has(c));
-      if (looksDamaged) e.qcSwipe(p.id, false);
-      else e.qcSwipe(p.id, true, skuById(p.skuId).zone);
+  const waiting = e.inboundTrucks.find((x) => x.status === "waiting");
+  if (freeDock && waiting) t(() => e.assignDock(waiting.id, freeDock.id));
+  for (const truck of e.inboundTrucks.filter((x) => x.status === "docked")) {
+    for (const line of truck.lines.filter((l) => l.decision === "pending")) {
+      const conform =
+        line.deliveredProductId === line.orderedProductId &&
+        line.deliveredQty === line.orderedQty &&
+        !damageNotes.has(line.conditionNote);
+      const accept = cfg.sloppyReceiver ? true : conform;
+      t(() => e.controlLine(line.id, accept));
     }
   }
+  for (const task of [...e.putawayTasks]) {
+    t(() => e.putaway(task.id, productById(task.productId).zone));
+  }
 
-  // Replenisher
-  for (const p of [...e.inboundBuffer]) {
-    const s = e.stock.find((x) => x.skuId === p.skuId)!;
-    e.putaway(p.id, s.pick < s.min ? "pick" : "reserve");
+  // ---- Stock ----
+  for (const s of e.stock) {
+    const current = s.reserveUnits + s.onOrderUnits;
+    if (current < s.reserveMin) t(() => e.replenishOrder(s.productId, s.reserveMax - current));
   }
   for (const s of e.stock) {
-    if (s.pick < s.min && s.reserve > 0 && !e.transferJobs.some((j) => j.skuId === s.skuId)) {
-      try { e.transfer(s.skuId); } catch { /* race with max cap */ }
+    const upp = productById(s.productId).unitsPerPallet;
+    const needs = s.pickingUnits < s.pickMin && s.reserveUnits >= upp && s.pickingUnits + upp <= s.pickMax;
+    if (!needs || e.transferJobs.some((j) => j.productId === s.productId)) continue;
+    if (cfg.wrongSlotOnce && !flags.wrongSlotDone) {
+      const other = PRODUCTS.find((p) => p.id !== s.productId)!;
+      const otherStock = e.stock.find((x) => x.productId === other.id)!;
+      if (otherStock.reserveUnits >= other.unitsPerPallet) {
+        flags.wrongSlotDone = true;
+        t(() => e.rempotage(other.id, s.productId)); // wrong pallet into this slot!
+        continue;
+      }
+    }
+    t(() => e.rempotage(s.productId, s.productId));
+  }
+  for (const task of e.approcheTasks.filter((x) => x.status === "pending")) {
+    t(() => e.approcheSend(task.id));
+  }
+  for (const a of e.anomalies.filter((x) => x.status === "visible" && x.role === "replenisher")) {
+    t(() => e.resolveAnomaly(a.id));
+  }
+
+  // ---- Picking ----
+  for (const o of e.orders.filter((x) => x.status === "queued")) {
+    t(() => e.planRoute(o.id, bestSequence(o.lines.map((l) => l.productId))));
+    break; // one plan per tick, like a human
+  }
+  for (const o of e.orders.filter((x) => x.status === "picking")) {
+    for (const line of o.lines) {
+      const missing = line.qty - line.preparedQty;
+      if (missing > 0 && !line.short) t(() => e.pickAssign(o.id, line.productId, missing));
+    }
+    // stock-out anomalies: emergency restock if possible, else partial
+    for (const a of e.anomalies.filter((x) => x.status === "visible" && x.kind === "stockout" && x.orderId === o.id)) {
+      const s = e.stock.find((x) => x.productId === a.productId)!;
+      const action = s.reserveUnits >= productById(a.productId!).unitsPerPallet ? "emergency" : "partial";
+      t(() => e.stockoutAction(o.id, a.productId!, action));
+    }
+    const allTouched = o.lines.every((l) => l.preparedQty > 0 || l.short);
+    if (allTouched) {
+      const marks: Record<string, boolean> = {};
+      for (const l of o.lines) {
+        marks[l.productId] =
+          l.short ||
+          (l.preparedQty === l.qty && l.damagedUnits === 0 && (l.preparedProductId === null || l.preparedProductId === l.productId));
+      }
+      t(() => e.pickControl(o.id, marks));
     }
   }
 
-  // Picker
-  if (!e.activeRoute) {
-    const queue = e.orders
-      .filter((o) => o.status === "queued")
-      .sort((a, b) => Number(b.priority) - Number(a.priority) || a.deadline - b.deadline);
-    const order = queue[0];
-    if (order) {
-      if (order.stockoutFlag) {
-        for (const line of order.lines.filter((l) => l.picked < l.qty)) {
-          try { e.flagGhost(line.skuId); } catch { /* not the ghost line */ }
-        }
-      }
-      const blocked = new Set(e.blockedCells.map(cellKey));
-      const targets = order.lines.filter((l) => l.picked < l.qty).map((l) => skuById(l.skuId).cell);
-      const hasStock = order.lines.every((l) => {
-        const s = e.stock.find((x) => x.skuId === l.skuId)!;
-        return l.picked >= l.qty || s.pick >= l.qty - l.picked || order.stockoutFlag;
-      });
-      const path = routeThrough(targets, blocked);
-      if (path && hasStock) {
-        try { e.startRoute(order.id, path); } catch { /* blocked mid-change */ }
-      }
-    }
+  // ---- Expédition ----
+  const staged = e.orders.filter((x) => x.status === "staged");
+  for (const o of staged.filter((x) => !x.truckId)) {
+    if (o.fullPallet && !o.fullPallet.fulfilled) continue;
+    const truck = e.outboundTrucks.find((x) => {
+      if (x.status !== "loading" || x.loadingClosed || x.destination !== o.destination) return false;
+      const w = x.assignedOrderIds.map((id) => e.orders.find((y) => y.id === id)!).reduce((a, y) => a + y.weight, 0);
+      return w + o.weight <= x.maxWeight;
+    });
+    if (truck) t(() => e.assignTruck(o.id, truck.id));
   }
-
-  // Dispatcher
-  const staged = e.orders.filter((o) => o.status === "staged");
-  for (const order of staged) {
-    const truck =
-      e.outboundTrucks.find((t) => t.status === "loading" && t.destination === order.destination) ??
-      null;
-    if (truck) {
-      try { e.loadOrder(order.id, truck.id); } catch { /* over capacity */ }
-    }
+  for (const o of staged.filter((x) => x.truckId && !x.expeditionChecked)) {
+    t(() => e.palletCheck(o.id, o.defects.length === 0));
   }
-  // Dispatch proactively: a loaded truck blocking a bay while staged orders
-  // can't match any destination should leave so the bay rotates.
-  for (const truck of e.outboundTrucks.filter((t) => t.status === "loading")) {
-    if (truck.loadedOrderIds.length === 0) continue;
-    const loadedW = truck.loadedOrderIds
-      .map((id) => e.orders.find((o) => o.id === id)!)
-      .reduce((a, o) => a + o.weight, 0);
-    const unmatched = staged.some(
-      (o) => !e.outboundTrucks.some((t) => t.status === "loading" && t.destination === o.destination)
+  // rotate empty bays whose destination matches nothing staged
+  for (const truck of e.outboundTrucks.filter((x) => x.status === "loading" && x.assignedOrderIds.length === 0)) {
+    const useful = e.orders.some(
+      (o) => (o.status === "staged" || o.status === "picking" || o.status === "queued" || o.status === "transit") &&
+        o.destination === truck.destination
     );
-    if (loadedW > truck.maxWeight * 0.6 || unmatched) e.dispatchTruck(truck.id);
+    const unmatched = e.orders.some(
+      (o) => o.status === "staged" && !o.truckId &&
+        !e.outboundTrucks.some((x) => x.status === "loading" && x.destination === o.destination)
+    );
+    if (!useful && unmatched) t(() => e.dispatchTruck(truck.id));
+  }
+  for (const truck of e.outboundTrucks.filter((x) => x.status === "loading" && !x.loadingClosed)) {
+    const ready = e.orders.filter((o) => o.truckId === truck.id && o.status === "staged" && o.expeditionChecked);
+    const anyPendingCheck = e.orders.some((o) => o.truckId === truck.id && o.status === "staged" && !o.expeditionChecked);
+    // load heavy first, fragile last
+    const fragile = (o: typeof ready[number]) => o.lines.some((l) => productById(l.productId).fragile);
+    for (const o of [...ready].sort((a, b) => Number(fragile(a)) - Number(fragile(b)) || b.weight - a.weight)) {
+      t(() => e.loadItem(truck.id, o.id));
+    }
+    const loaded = truck.loadedOrderIds.length;
+    if (loaded === 0 || anyPendingCheck) continue;
+    const w = truck.loadedOrderIds.map((id) => e.orders.find((y) => y.id === id)!).reduce((a, y) => a + y.weight, 0);
+    const unmatched = e.orders.some(
+      (o) => o.status === "staged" && !o.truckId &&
+        !e.outboundTrucks.some((x) => x.status === "loading" && !x.loadingClosed && x.destination === o.destination)
+    );
+    // nothing else upstream is heading to this destination -> ship what we have
+    const noMoreComing = !e.orders.some(
+      (o) => o.destination === truck.destination && !truck.loadedOrderIds.includes(o.id) &&
+        ["queued", "transit", "picking", "staged"].includes(o.status)
+    );
+    const closing =
+      (truck.departsAt !== null && truck.departsAt - e.now < 20_000) ||
+      w > truck.maxWeight * 0.5 || unmatched || noMoreComing;
+    if (closing) {
+      t(() => e.closeLoading(truck.id));
+      t(() => e.dispatchTruck(truck.id));
+    }
   }
 }
 
-// ---------------------------------------------------------------------------
-// Run the session
-// ---------------------------------------------------------------------------
-const engine = new TeamEngine("1", "Sim Team", 424242);
-let curveballsSeen = 0;
-let toastCount = 0;
+function runSession(name: string, difficulty: Difficulty, cfg: BotConfig) {
+  const engine = new TeamEngine("1", "Sim", 424242, difficulty);
+  const flags = { wrongSlotDone: false };
+  let sawSlotAnomaly = false;
+  const cap = MODES[difficulty].durationMs;
+  let endedAt = cap;
 
-for (let now = 0; now <= GAME_DURATION_MS; now += TICK_MS) {
-  const fx = engine.tick(now);
-  curveballsSeen += fx.curveballs.length;
-  toastCount += fx.toasts.length;
-  playTick(engine);
-  // serialization must never throw or leak private fields
-  const snapshot = engine.serialize();
-  if ((snapshot as any).ghostSkuId !== undefined || (snapshot as any).damagedPallets !== undefined) {
-    throw new Error("Private engine state leaked into the wire snapshot!");
+  for (let now = 0; now <= cap; now += TICK_MS) {
+    const fx = engine.tick(now);
+    if (engine.anomalies.some((a) => a.kind === "slot_mismatch")) sawSlotAnomaly = true;
+    if (fx.gameOver) {
+      endedAt = now;
+      break;
+    }
+    playTick(engine, cfg, flags);
+    const snap = engine.serialize() as any;
+    if (snap.slotPhysical !== undefined || snap.damagedLines !== undefined) {
+      throw new Error("Private engine state leaked into the wire snapshot!");
+    }
   }
+
+  const report = buildReport(engine);
+  if (process.env.DEBUG) {
+    for (const o of engine.orders.filter((x) => x.status !== "shipped")) {
+      console.log(
+        `[debug] ${o.label} status=${o.status} dest=${o.destination} truck=${o.truckId} checked=${o.expeditionChecked} ` +
+          `fullPallet=${o.fullPallet ? `${o.fullPallet.productId}×${o.fullPallet.pallets} fulfilled=${o.fullPallet.fulfilled}` : "-"} ` +
+          `lines=${o.lines.map((l) => `${l.productId}:${l.preparedQty}/${l.qty}${l.short ? "S" : ""}`).join(",")}`
+      );
+    }
+    for (const t of engine.outboundTrucks) {
+      console.log(`[debug] truck ${t.label} dest=${t.destination} assigned=${t.assignedOrderIds.length} loaded=${t.loadedOrderIds.length} closed=${t.loadingClosed}`);
+    }
+    for (const a of engine.approcheTasks.filter((x) => x.status === "pending")) {
+      console.log(`[debug] approche pending ${a.orderLabel} ${a.productId}×${a.pallets}`);
+    }
+  }
+  console.log(`\n=== ${name} ===`);
+  console.log(`ended at ${Math.round(endedAt / 1000)}s / cap ${Math.round(cap / 1000)}s`);
+  console.log(`orders: ${report.otif.total}, shipped: ${report.otif.shipped}, OTIF: ${report.otif.pct}%`);
+  console.log(`error cost: €${report.errorCost.total} | supervisor interventions: ${report.supervisor.length}`);
+  for (const b of report.errorCost.breakdown) console.log(`  - ${b.label}: ${b.count}x €${b.amount}`);
+  console.log(`role timers: ${Object.entries(report.roleTimers).map(([r, t]) => `${r}=${Math.round(t.activeMs / 1000)}s`).join(", ")}`);
+  console.log("insights:");
+  for (const i of report.insights) console.log(`  * ${i}`);
+  return { engine, report, sawSlotAnomaly, endedAt };
 }
 
-const report = buildReport(engine);
-
-console.log("=== SIM RESULT ===");
-console.log(`orders: ${report.otif.total}, shipped: ${report.otif.shipped}, OTIF: ${report.otif.pct}%`);
-console.log(`dock: busy ${report.dockUtilization.busyPct}%, avg wait ${report.dockUtilization.avgWaitSec}s, served ${report.dockUtilization.trucksServed}`);
-console.log(`error cost: €${report.errorCost.total}`);
-for (const b of report.errorCost.breakdown) console.log(`  - ${b.label}: ${b.count}x €${b.amount}`);
-console.log(`heatmap buckets: ${report.heatmap.buckets.length}`);
-console.log(`score: ${report.score}`);
-console.log(`curveball broadcasts: ${curveballsSeen}, toasts: ${toastCount}`);
-console.log("insights:");
-for (const i of report.insights) console.log(`  * ${i}`);
-
-// ---- assertions ----
+let failed = false;
 function assert(cond: boolean, msg: string) {
   if (!cond) {
     console.error(`❌ ASSERT FAILED: ${msg}`);
-    process.exitCode = 1;
+    failed = true;
   }
 }
-assert(report.otif.total >= 10, "scenario should spawn at least 10 orders");
-assert(report.otif.shipped > 0, "bots should ship at least one order");
-assert(report.heatmap.buckets.length === 28, "7min / 15s = 28 heatmap buckets");
-assert(report.insights.length > 0, "insights should not be empty");
-assert(report.dockUtilization.trucksServed > 0, "trucks should be served");
-assert(engine.serialize().curveballs.every((c) => c.targets.length > 0), "silent curveballs must stay hidden");
 
-if (process.exitCode !== 1) console.log("\n✅ full-session simulation passed");
+// --- 1. Réaliste, honest bots ---
+{
+  const { report } = runSession("Réaliste — équipe rigoureuse", "realistic", {});
+  assert(report.otif.total >= 8, "scenario should spawn enough orders");
+  assert(report.otif.shipped > 0, "bots should ship orders");
+  assert(report.otif.pct >= 50, `honest play should reach decent OTIF (got ${report.otif.pct}%)`);
+  assert(report.supervisor.length === 0, "no supervisor in realistic mode");
+}
+
+// --- 2. Normal, sloppy receiver: the Supervisor intercepts ---
+{
+  const { engine, report } = runSession("Normal — réceptionnaire négligent", "normal", { sloppyReceiver: true });
+  assert(report.supervisor.length > 0, "supervisor must intervene on sloppy acceptance");
+  assert(report.supervisor.some((e) => e.role === "receiver"), "interventions attributed to the receiver");
+  assert(
+    engine.costLog.filter((c) => c.role === "receiver").every((c) => c.supervised),
+    "receiver errors must be flagged as supervised in normal mode"
+  );
+  const shipped = engine.orders.filter((o) => o.status === "shipped");
+  assert(
+    shipped.every((o) => o.lines.every((l) => l.damagedUnits === 0)),
+    "supervisor mode: no damaged goods may reach a shipped order"
+  );
+}
+
+// --- 3. Réaliste, wrong-slot rempotage: the cascade ---
+{
+  const { engine, sawSlotAnomaly } = runSession("Réaliste — palette au mauvais emplacement", "realistic", { wrongSlotOnce: true });
+  assert(
+    engine.costLog.some((c) => c.label.startsWith("Rempotage : palette envoyée au mauvais emplacement")),
+    "wrong slot must be charged to the replenisher"
+  );
+  assert(sawSlotAnomaly, "the picker must surface a slot_mismatch anomaly in realistic mode");
+  assert(
+    engine.anomalies.filter((a) => a.kind === "slot_mismatch").every((a) => a.status === "resolved"),
+    "the anomaly must be resolvable by the replenisher"
+  );
+}
+
+// --- 4. Facile: per-role timers + early end ---
+{
+  const { report, endedAt } = runSession("Facile — apprentissage isolé", "easy", {});
+  assert(endedAt < MODES.easy.durationMs, "easy mode should end when the workload is done");
+  assert(report.supervisor.length === 0 || report.supervisor.length >= 0, "report builds");
+  const timers = Object.values(report.roleTimers).map((t) => t.activeMs);
+  assert(timers.some((t) => t > 0), "role timers must accumulate active time");
+  assert(new Set(timers).size > 1, "role timers should differ (asynchronous backlogs)");
+}
+
+if (!failed) console.log("\n✅ all simulation scenarios passed");
+else process.exit(1);

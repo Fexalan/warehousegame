@@ -1,4 +1,3 @@
-import { CurveballBanner } from "./components/CurveballBanner";
 import { Hud } from "./components/Hud";
 import { Toasts } from "./components/Toasts";
 import { Dashboard } from "./screens/Dashboard";
@@ -12,7 +11,7 @@ import { useTicker } from "./useTicker";
 
 export default function App() {
   const game = useGame();
-  useTicker(250); // re-render for countdowns & animations
+  useTicker(250); // re-render for countdowns & progress bars
 
   if (game.phase === "over" && game.reports) {
     return <Dashboard reports={game.reports} seat={game.seat} />;
@@ -21,7 +20,7 @@ export default function App() {
   if (game.phase === "playing" && game.state && game.seat) {
     const { state, seat } = game;
     const screen = {
-      receiver: <ReceiverScreen state={state} send={game.send} />,
+      receiver: <ReceiverScreen state={state} send={game.send} gameNow={game.gameNow} />,
       replenisher: <ReplenisherScreen state={state} send={game.send} gameNow={game.gameNow} />,
       picker: <PickerScreen state={state} send={game.send} gameNow={game.gameNow} />,
       dispatcher: <DispatcherScreen state={state} send={game.send} gameNow={game.gameNow} />,
@@ -31,7 +30,6 @@ export default function App() {
       <div className="app">
         <Hud state={state} seat={seat} gameNow={game.gameNow} />
         {screen}
-        <CurveballBanner curveball={game.curveball} dismiss={game.dismissCurveball} gameNow={game.gameNow} />
         <Toasts toasts={game.toasts} />
       </div>
     );
