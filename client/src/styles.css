@@ -248,4 +248,82 @@ button { font: inherit; color: inherit; cursor: pointer; border: none; backgroun
 @media (max-width: 860px) {
   .plan-panel, .pick-panel, .rempotage-grid { grid-template-columns: 1fr; }
   .role-cost-row { grid-template-columns: 1fr 1fr; }
+  .home-cards, .solo-debrief-cols { grid-template-columns: 1fr; }
 }
+
+/* ===========================================================================
+   HOME ROUTER
+   =========================================================================== */
+.home-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px; }
+.home-card {
+  background: var(--panel); border: 1px solid #34415f; border-radius: var(--radius);
+  padding: 26px 22px; text-align: left; display: flex; flex-direction: column; gap: 10px;
+  transition: border-color 0.1s, transform 0.05s;
+}
+.home-card:hover { border-color: var(--accent); }
+.home-card:active { transform: scale(0.99); }
+.home-card b { font-size: 1.3rem; }
+.home-card small { color: var(--muted); line-height: 1.5; }
+.home-emoji { font-size: 2.4rem; }
+.home-go { color: var(--accent); font-weight: 700; margin-top: auto; }
+.team-wrap { position: relative; }
+
+/* ===========================================================================
+   SOLO TRAINER
+   =========================================================================== */
+.solo-back { position: absolute; top: 16px; left: 16px; z-index: 5; }
+.solo-label { display: block; text-align: left; max-width: 760px; margin: 22px auto 8px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.82rem; }
+.solo-steps { display: block; margin-top: 6px; color: var(--accent) !important; font-size: 0.74rem; }
+
+.solo-hud { gap: 16px; }
+.solo-hud-id { display: flex; flex-direction: column; }
+.solo-last { color: var(--green); font-weight: 700; min-width: 160px; }
+.solo-screen { padding-top: 12px; }
+.step-tab.step-done { border-color: var(--green); color: var(--green); }
+
+/* info tab */
+.info-tab { background: var(--panel2); border: 1px solid #34415f; border-radius: 10px; overflow: hidden; }
+.info-toggle { width: 100%; text-align: left; padding: 10px 14px; font-weight: 700; color: var(--accent); display: flex; justify-content: space-between; align-items: center; }
+.info-caret { color: var(--muted); font-size: 0.8rem; }
+.info-body { padding: 0 14px 14px; color: var(--text); line-height: 1.5; }
+
+/* shared solo widgets */
+.solo-select { background: var(--bg); border: 1px solid #34415f; border-radius: 6px; color: var(--text); padding: 6px 8px; font-size: 0.92rem; min-width: 130px; }
+.btn-link { background: none; border: none; color: var(--muted); text-decoration: underline; padding: 4px; font-size: 0.85rem; }
+.solo-order-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.solo-dock-load { display: flex; gap: 10px; margin: 12px 0; }
+.solo-plan-banner { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; background: var(--panel2); border-radius: 10px; padding: 12px; margin-bottom: 14px; }
+.solo-screen .btn-big { margin-top: 14px; }
+
+.tag.prio-urgent, .tag.prio-haute { color: var(--red); }
+.tag.prio-standard, .tag.prio-moyenne { color: var(--amber); }
+.tag.prio-basse { color: var(--muted); }
+.rot-forte { color: var(--green); }
+.rot-faible { color: var(--red); }
+
+/* pick-path & load sequencing grids */
+.solo-pathgrid, .solo-load-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin: 10px 0; }
+.path-cell {
+  position: relative; background: var(--panel2); border: 1px solid #34415f; border-radius: 10px;
+  padding: 16px 10px; display: flex; flex-direction: column; gap: 2px; align-items: center;
+}
+.path-cell.picked { border-color: var(--accent); background: rgba(56,189,248,0.12); }
+.path-cell small { color: var(--muted); }
+.path-seq { background: var(--accent); color: #06283d; border-radius: 999px; padding: 1px 9px; font-weight: 800; font-size: 0.82rem; }
+.path-cell .path-seq { position: absolute; top: -8px; right: -8px; }
+
+/* ===========================================================================
+   SOLO DEBRIEF
+   =========================================================================== */
+.solo-grade-banner { text-align: center; background: rgba(52,211,153,0.15); color: var(--green); font-weight: 800; padding: 8px; border-radius: 999px; align-self: center; padding-inline: 24px; }
+.grade-card { background: var(--panel2); }
+.grade-letter { font-size: 3.2rem; font-weight: 900; line-height: 1; }
+.grade-A { color: var(--green); } .grade-B { color: #86efac; } .grade-C { color: var(--amber); }
+.grade-D { color: #fb923c; } .grade-E { color: var(--red); }
+.task-bars { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+.task-bar { display: flex; flex-direction: column; gap: 6px; }
+.task-bar-head { display: flex; justify-content: space-between; align-items: center; }
+.solo-debrief-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.debrief-row { display: flex; justify-content: space-between; padding: 9px 4px; border-bottom: 1px solid #2a3552; }
+.solo-debrief-actions { display: flex; gap: 12px; justify-content: center; margin-top: 8px; }
+@media (max-width: 860px) { .task-bars { grid-template-columns: 1fr; } }

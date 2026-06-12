@@ -1,13 +1,24 @@
 # 🏭 Simulateur Entrepôt
 
-A real-time, multiplayer warehouse training simulator. Up to 5 teams of 4,
-each player running one of the four interdependent roles on one shared
-supply chain — **Réception, Stock, Picking, Expédition** — each role a
-3-step professional workflow (tables, bills of delivery, min/max maths,
-pick-path planning, load sequencing). Three difficulty modes change the
-clock model and whether mistakes cascade.
+A warehouse training simulator with **two coexisting modes**, selected from
+the Home screen:
 
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for the design.
+* **Session équipe** — the real-time, multiplayer simulator. Up to 5 teams of
+  4, each player running one of the four interdependent roles on one shared
+  supply chain — **Réception, Stock, Picking, Expédition** — each a 3-step
+  professional workflow. Three difficulty modes change the clock model and
+  whether mistakes cascade.
+* **Entraînement solo** — a single-player trainer for onboarding a new
+  operator quickly. Pick **one** role and **one** difficulty, then work that
+  role's three steps alone against randomly-generated, self-contained data
+  (independent of any other role). Each step has a short info tab explaining
+  the task, per-action scoring, and an end-of-session debrief (grade,
+  per-task score /100, strengths and improvement axes).
+
+The same difficulty system (Facile · Normal · Réaliste) drives both modes.
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the multiplayer design and
+[`client/src/solo/`](./client/src/solo/) for the solo trainer.
 
 ## Quick start
 
